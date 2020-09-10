@@ -7,50 +7,52 @@ package logdb
 
 // create a table for events
 const (
+	configTableSchema = `CREATE TABLE IF NOT EXISTS config (
+	key CHAR(20) PRIMARY KEY,
+	value BLOB
+);`
+
+	refTableScheme = `CREATE TABLE IF NOT EXISTS ref (
+	id INTEGER PRIMARY KEY NOT NULL,
+	data BLOB NOT NULL UNIQUE
+);`
+
 	eventTableSchema = `CREATE TABLE IF NOT EXISTS event (
-	blockID	BLOB(32),
-	eventIndex INTEGER,
-	blockNumber INTEGER,
-	blockTime INTEGER,
-	txID BLOB(32),
-	txOrigin BLOB(20),
-	address BLOB(20),	
-	topic0 BLOB(32),
-	topic1 BLOB(32),
-	topic2 BLOB(32),
-	topic3 BLOB(32),
-	topic4 BLOB(32),
+	seq INTEGER PRIMARY KEY NOT NULL,
+	blockID	INTEGER NOT NULL,
+	blockTime INTEGER NOT NULL,
+	txID INTEGER NOT NULL,
+	txOrigin INTEGER NOT NULL,
+	clauseIndex INTEGER NOT NULL,
+	address INTEGER NOT NULL,
+	topic0 INTEGER,
+	topic1 INTEGER,
+	topic2 INTEGER,
+	topic3 INTEGER,
+	topic4 INTEGER,
 	data BLOB
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS prim ON event(blockID, eventIndex);
-
-CREATE INDEX IF NOT EXISTS blockNumberIndex ON event(blockNumber);
-CREATE INDEX IF NOT EXISTS blockTimeIndex ON event(blockTime);
-CREATE INDEX IF NOT EXISTS addressIndex ON event(address);
-CREATE INDEX IF NOT EXISTS topicIndex0 ON event(topic0);
-CREATE INDEX IF NOT EXISTS topicIndex1 ON event(topic1);
-CREATE INDEX IF NOT EXISTS topicIndex2 ON event(topic2);
-CREATE INDEX IF NOT EXISTS topicIndex3 ON event(topic3);
-CREATE INDEX IF NOT EXISTS topicIndex4 ON event(topic4);`
+CREATE INDEX IF NOT EXISTS event_i0 ON event(address);
+CREATE INDEX IF NOT EXISTS event_i1 ON event(topic0, address);
+CREATE INDEX IF NOT EXISTS event_i2 ON event(topic1, topic0, address) WHERE topic1 IS NOT NULL;
+CREATE INDEX IF NOT EXISTS event_i3 ON event(topic2, topic0, address) WHERE topic2 IS NOT NULL;
+CREATE INDEX IF NOT EXISTS event_i4 ON event(topic3, topic0, address) WHERE topic3 IS NOT NULL;`
 
 	// create a table for transfer
 	transferTableSchema = `CREATE TABLE IF NOT EXISTS transfer (
-	blockID	BLOB(32),
-	transferIndex INTEGER,
-	blockNumber INTEGER,
-	blockTime INTEGER,
-	txID BLOB(32),
-	txOrigin BLOB(20),
-	sender BLOB(20),
-	recipient BLOB(20),
-	amount BLOB
+	seq INTEGER PRIMARY KEY NOT NULL,
+	blockID	INTEGER NOT NULL,
+	blockTime INTEGER NOT NULL,
+	txID INTEGER NOT NULL,
+	txOrigin INTEGER NOT NULL,
+	clauseIndex INTEGER NOT NULL,
+	sender INTEGER NOT NULL,
+	recipient INTEGER NOT NULL,
+	amount BLOB(32)
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS prim ON transfer(blockID, transferIndex);
-
-CREATE INDEX IF NOT EXISTS blockNumberIndex ON transfer(blockNumber);
-CREATE INDEX IF NOT EXISTS blockTimeIndex ON transfer(blockTime);
-CREATE INDEX IF NOT EXISTS senderIndex ON transfer(sender);
-CREATE INDEX IF NOT EXISTS recipientIndex ON transfer(recipient);`
+CREATE INDEX IF NOT EXISTS transfer_i0 ON transfer(txOrigin);
+CREATE INDEX IF NOT EXISTS transfer_i1 ON transfer(sender);
+CREATE INDEX IF NOT EXISTS transfer_i2 ON transfer(recipient);`
 )

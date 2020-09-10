@@ -12,22 +12,30 @@ import (
 	"github.com/gorilla/mux"
 	"github.com/pkg/errors"
 	"github.com/vechain/thor/api/utils"
+	"github.com/vechain/thor/chain"
 	"github.com/vechain/thor/logdb"
 )
 
 type Events struct {
-	db *logdb.LogDB
+	repo *chain.Repository
+	db   *logdb.LogDB
 }
 
-func New(db *logdb.LogDB) *Events {
+func New(repo *chain.Repository, db *logdb.LogDB) *Events {
 	return &Events{
+		repo,
 		db,
 	}
 }
 
 //Filter query events with option
 func (e *Events) filter(ctx context.Context, ef *EventFilter) ([]*FilteredEvent, error) {
-	events, err := e.db.FilterEvents(ctx, convertEventFilter(ef))
+	chain := e.repo.NewBestChain()
+	filter, err := convertEventFilter(chain, ef)
+	if err != nil {
+		return nil, err
+	}
+	events, err := e.db.FilterEvents(ctx, filter)
 	if err != nil {
 		return nil, err
 	}
@@ -39,11 +47,11 @@ func (e *Events) filter(ctx context.Context, ef *EventFilter) ([]*FilteredEvent,
 }
 
 func (e *Events) handleFilter(w http.ResponseWriter, req *http.Request) error {
-	var filter *EventFilter
+	var filter EventFilter
 	if err := utils.ParseJSON(req.Body, &filter); err != nil {
 		return utils.BadRequest(errors.WithMessage(err, "body"))
 	}
-	fes, err := e.filter(req.Context(), filter)
+	fes, err := e.filter(req.Context(), &filter)
 	if err != nil {
 		return err
 	}

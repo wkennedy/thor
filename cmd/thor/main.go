@@ -16,15 +16,16 @@ import (
 	"github.com/ethereum/go-ethereum/accounts/keystore"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/inconshreveable/log15"
-	"github.com/mattn/go-isatty"
+	isatty "github.com/mattn/go-isatty"
 	"github.com/pborman/uuid"
 	"github.com/pkg/errors"
 	"github.com/vechain/thor/api"
 	"github.com/vechain/thor/cmd/thor/node"
+	"github.com/vechain/thor/cmd/thor/pruner"
 	"github.com/vechain/thor/cmd/thor/solo"
 	"github.com/vechain/thor/genesis"
 	"github.com/vechain/thor/logdb"
-	"github.com/vechain/thor/lvldb"
+	"github.com/vechain/thor/muxdb"
 	"github.com/vechain/thor/state"
 	"github.com/vechain/thor/thor"
 	"github.com/vechain/thor/txpool"
@@ -62,7 +63,9 @@ func main() {
 			networkFlag,
 			configDirFlag,
 			dataDirFlag,
+			cacheFlag,
 			beneficiaryFlag,
+			targetGasLimitFlag,
 			apiAddrFlag,
 			apiCorsFlag,
 			apiTimeoutFlag,
@@ -72,6 +75,11 @@ func main() {
 			maxPeersFlag,
 			p2pPortFlag,
 			natFlag,
+			bootNodeFlag,
+			skipLogsFlag,
+			pprofFlag,
+			verifyLogsFlag,
+			disablePrunerFlag,
 		},
 		Action: defaultAction,
 		Commands: []cli.Command{
@@ -80,20 +88,28 @@ func main() {
 				Usage: "client runs in solo mode for test & dev",
 				Flags: []cli.Flag{
 					dataDirFlag,
+					cacheFlag,
 					apiAddrFlag,
 					apiCorsFlag,
 					apiTimeoutFlag,
+					apiCallGasLimitFlag,
 					apiBacktraceLimitFlag,
 					onDemandFlag,
 					persistFlag,
 					gasLimitFlag,
 					verbosityFlag,
+					pprofFlag,
+					verifyLogsFlag,
+					skipLogsFlag,
+					txPoolLimitFlag,
+					txPoolLimitPerAccountFlag,
+					disablePrunerFlag,
 				},
 				Action: soloAction,
 			},
 			{
 				Name:  "master-key",
-				Usage: "import and export master key",
+				Usage: "master key management",
 				Flags: []cli.Flag{
 					configDirFlag,
 					importMasterKeyFlag,
@@ -116,86 +132,187 @@ func defaultAction(ctx *cli.Context) error {
 	defer func() { log.Info("exited") }()
 
 	initLogger(ctx)
-	gene := selectGenesis(ctx)
-	instanceDir := makeInstanceDir(ctx, gene)
+	gene, forkConfig, err := selectGenesis(ctx)
+	if err != nil {
+		return err
+	}
+	instanceDir, err := makeInstanceDir(ctx, gene)
+	if err != nil {
+		return err
+	}
 
-	mainDB := openMainDB(ctx, instanceDir)
+	mainDB, err := openMainDB(ctx, instanceDir)
+	if err != nil {
+		return err
+	}
 	defer func() { log.Info("closing main database..."); mainDB.Close() }()
 
-	logDB := openLogDB(ctx, instanceDir)
+	skipLogs := ctx.Bool(skipLogsFlag.Name)
+
+	logDB, err := openLogDB(ctx, instanceDir)
+	if err != nil {
+		return err
+	}
 	defer func() { log.Info("closing log database..."); logDB.Close() }()
 
-	chain := initChain(gene, mainDB, logDB)
-	master := loadNodeMaster(ctx)
+	repo, err := initChainRepository(gene, mainDB, logDB)
+	if err != nil {
+		return err
+	}
 
-	txPool := txpool.New(chain, state.NewCreator(mainDB), defaultTxPoolOptions)
+	master, err := loadNodeMaster(ctx)
+	if err != nil {
+		return err
+	}
+
+	printStartupMessage1(gene, repo, master, instanceDir, forkConfig)
+
+	if !skipLogs {
+		if err := syncLogDB(exitSignal, repo, logDB, ctx.Bool(verifyLogsFlag.Name)); err != nil {
+			return err
+		}
+	}
+
+	txpoolOpt := defaultTxPoolOptions
+	txPool := txpool.New(repo, state.NewStater(mainDB), txpoolOpt)
 	defer func() { log.Info("closing tx pool..."); txPool.Close() }()
 
-	p2pcom := newP2PComm(ctx, chain, txPool, instanceDir)
-	apiHandler, apiCloser := api.New(chain, state.NewCreator(mainDB), txPool, logDB, p2pcom.comm, ctx.String(apiCorsFlag.Name), uint32(ctx.Int(apiBacktraceLimitFlag.Name)), uint64(ctx.Int(apiCallGasLimitFlag.Name)))
+	p2pcom, err := newP2PComm(ctx, repo, txPool, instanceDir)
+	if err != nil {
+		return err
+	}
+	apiHandler, apiCloser := api.New(
+		repo,
+		state.NewStater(mainDB),
+		txPool,
+		logDB,
+		p2pcom.comm,
+		ctx.String(apiCorsFlag.Name),
+		uint32(ctx.Int(apiBacktraceLimitFlag.Name)),
+		uint64(ctx.Int(apiCallGasLimitFlag.Name)),
+		ctx.Bool(pprofFlag.Name),
+		skipLogs,
+		forkConfig)
 	defer func() { log.Info("closing API..."); apiCloser() }()
 
-	apiURL, srvCloser := startAPIServer(ctx, apiHandler, chain.GenesisBlock().Header().ID())
+	apiURL, srvCloser, err := startAPIServer(ctx, apiHandler, repo.GenesisBlock().Header().ID())
+	if err != nil {
+		return err
+	}
 	defer func() { log.Info("stopping API server..."); srvCloser() }()
 
-	printStartupMessage(gene, chain, master, instanceDir, apiURL)
+	printStartupMessage2(apiURL, p2pcom.enode)
 
-	p2pcom.Start()
+	if err := p2pcom.Start(); err != nil {
+		return err
+	}
 	defer p2pcom.Stop()
+
+	if !ctx.Bool(disablePrunerFlag.Name) {
+		pruner := pruner.New(mainDB, repo)
+		defer func() { log.Info("stopping pruner..."); pruner.Stop() }()
+	}
 
 	return node.New(
 		master,
-		chain,
-		state.NewCreator(mainDB),
+		repo,
+		state.NewStater(mainDB),
 		logDB,
 		txPool,
 		filepath.Join(instanceDir, "tx.stash"),
-		p2pcom.comm).
-		Run(exitSignal)
+		p2pcom.comm,
+		uint64(ctx.Int(targetGasLimitFlag.Name)),
+		skipLogs,
+		forkConfig).Run(exitSignal)
 }
 
 func soloAction(ctx *cli.Context) error {
+	exitSignal := handleExitSignal()
 	defer func() { log.Info("exited") }()
 
 	initLogger(ctx)
 	gene := genesis.NewDevnet()
+	// Solo forks from the start
+	forkConfig := thor.ForkConfig{}
 
-	var mainDB *lvldb.LevelDB
+	var mainDB *muxdb.MuxDB
 	var logDB *logdb.LogDB
 	var instanceDir string
+	var err error
 
-	if ctx.Bool("persist") {
-		instanceDir = makeInstanceDir(ctx, gene)
-		mainDB = openMainDB(ctx, instanceDir)
-		logDB = openLogDB(ctx, instanceDir)
+	if ctx.Bool(persistFlag.Name) {
+		if instanceDir, err = makeInstanceDir(ctx, gene); err != nil {
+			return err
+		}
+		if mainDB, err = openMainDB(ctx, instanceDir); err != nil {
+			return err
+		}
+		defer func() { log.Info("closing main database..."); mainDB.Close() }()
+		if logDB, err = openLogDB(ctx, instanceDir); err != nil {
+			return err
+		}
+		defer func() { log.Info("closing log database..."); logDB.Close() }()
 	} else {
 		instanceDir = "Memory"
 		mainDB = openMemMainDB()
 		logDB = openMemLogDB()
 	}
 
-	defer func() { log.Info("closing main database..."); mainDB.Close() }()
-	defer func() { log.Info("closing log database..."); logDB.Close() }()
+	repo, err := initChainRepository(gene, mainDB, logDB)
+	if err != nil {
+		return err
+	}
 
-	chain := initChain(gene, mainDB, logDB)
+	skipLogs := ctx.Bool(skipLogsFlag.Name)
 
-	txPool := txpool.New(chain, state.NewCreator(mainDB), defaultTxPoolOptions)
+	if !skipLogs {
+		if err := syncLogDB(exitSignal, repo, logDB, ctx.Bool(verifyLogsFlag.Name)); err != nil {
+			return err
+		}
+	}
+
+	txPoolOption := defaultTxPoolOptions
+	txPoolOption.Limit = ctx.Int(txPoolLimitFlag.Name)
+	txPoolOption.LimitPerAccount = ctx.Int(txPoolLimitPerAccountFlag.Name)
+
+	txPool := txpool.New(repo, state.NewStater(mainDB), txPoolOption)
 	defer func() { log.Info("closing tx pool..."); txPool.Close() }()
 
-	apiHandler, apiCloser := api.New(chain, state.NewCreator(mainDB), txPool, logDB, solo.Communicator{}, ctx.String(apiCorsFlag.Name), uint32(ctx.Int(apiBacktraceLimitFlag.Name)), uint64(ctx.Int(apiCallGasLimitFlag.Name)))
+	apiHandler, apiCloser := api.New(
+		repo,
+		state.NewStater(mainDB),
+		txPool,
+		logDB,
+		solo.Communicator{},
+		ctx.String(apiCorsFlag.Name),
+		uint32(ctx.Int(apiBacktraceLimitFlag.Name)),
+		uint64(ctx.Int(apiCallGasLimitFlag.Name)),
+		ctx.Bool(pprofFlag.Name),
+		skipLogs,
+		forkConfig)
 	defer func() { log.Info("closing API..."); apiCloser() }()
 
-	apiURL, srvCloser := startAPIServer(ctx, apiHandler, chain.GenesisBlock().Header().ID())
+	apiURL, srvCloser, err := startAPIServer(ctx, apiHandler, repo.GenesisBlock().Header().ID())
+	if err != nil {
+		return err
+	}
 	defer func() { log.Info("stopping API server..."); srvCloser() }()
 
-	printSoloStartupMessage(gene, chain, instanceDir, apiURL)
+	printSoloStartupMessage(gene, repo, instanceDir, apiURL, forkConfig)
 
-	return solo.New(chain,
-		state.NewCreator(mainDB),
+	if !ctx.Bool(disablePrunerFlag.Name) {
+		pruner := pruner.New(mainDB, repo)
+		defer func() { log.Info("stopping pruner..."); pruner.Stop() }()
+	}
+
+	return solo.New(repo,
+		state.NewStater(mainDB),
 		logDB,
 		txPool,
-		uint64(ctx.Int("gas-limit")),
-		ctx.Bool("on-demand")).Run(handleExitSignal())
+		uint64(ctx.Int(gasLimitFlag.Name)),
+		ctx.Bool(onDemandFlag.Name),
+		skipLogs,
+		forkConfig).Run(exitSignal)
 }
 
 func masterKeyAction(ctx *cli.Context) error {
@@ -205,8 +322,18 @@ func masterKeyAction(ctx *cli.Context) error {
 		return fmt.Errorf("flag %s and %s are exclusive", importMasterKeyFlag.Name, exportMasterKeyFlag.Name)
 	}
 
+	keyPath, err := masterKeyPath(ctx)
+	if err != nil {
+		return err
+	}
+
 	if !hasImportFlag && !hasExportFlag {
-		return fmt.Errorf("missing flag, either %s or %s", importMasterKeyFlag.Name, exportMasterKeyFlag.Name)
+		masterKey, err := loadOrGeneratePrivateKey(keyPath)
+		if err != nil {
+			return err
+		}
+		fmt.Println("Master:", thor.Address(crypto.PubkeyToAddress(masterKey.PublicKey)))
+		return nil
 	}
 
 	if hasImportFlag {
@@ -231,7 +358,7 @@ func masterKeyAction(ctx *cli.Context) error {
 			return errors.WithMessage(err, "decrypt")
 		}
 
-		if err := crypto.SaveECDSA(masterKeyPath(ctx), key.PrivateKey); err != nil {
+		if err := crypto.SaveECDSA(keyPath, key.PrivateKey); err != nil {
 			return err
 		}
 		fmt.Println("Master key imported:", thor.Address(key.Address))
@@ -239,7 +366,7 @@ func masterKeyAction(ctx *cli.Context) error {
 	}
 
 	if hasExportFlag {
-		masterKey, err := loadOrGeneratePrivateKey(masterKeyPath(ctx))
+		masterKey, err := loadOrGeneratePrivateKey(keyPath)
 		if err != nil {
 			return err
 		}

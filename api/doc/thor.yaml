@@ -8,7 +8,7 @@ info:
   license:
     name: LGPL 3.0
     url: 'https://www.gnu.org/licenses/lgpl-3.0.en.html'
-  version: 1.0.3
+  version: 1.3.2
 
 servers:
   - url: '/'
@@ -27,6 +27,8 @@ tags:
     description: Access to node status info
   - name: Subscriptions
     description: Subscribe interested subjects
+  - name: Debug
+    description: Debug utilities
     
 paths:
   /accounts/{address}:
@@ -50,6 +52,7 @@ paths:
                 $ref: '#/components/schemas/Account'
 
     post:
+      deprecated: true
       tags:
         - Accounts
       summary: Execute account code
@@ -71,9 +74,33 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/CallResult'
+  /accounts/*:
+    post:
+      parameters:
+        - $ref: '#/components/parameters/RevisionInQuery'
+      tags:
+        - Accounts
+      summary: Execute a batch of codes
+      description: |
+        to simulate execution of a transaction.
+      requestBody:
+        description: arguments and environment
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BatchCallData'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BatchCallResult'
 
   /accounts:
     post:
+      deprecated: true
       parameters:
         - $ref: '#/components/parameters/RevisionInQuery'
       tags:
@@ -144,19 +171,50 @@ paths:
       - $ref: '#/components/parameters/TxIDInPath'
       - $ref: '#/components/parameters/RawInQuery'
       - $ref: '#/components/parameters/HeadInQuery'
+      - $ref: '#/components/parameters/PendingInQuery'
     get:
       tags:
         - Transactions
       summary: Retrieve transaction
       description: |
-        by ID.
+        by ID. When `pending` is true, a pending tx with null `meta` might be returned.
       responses:
         '200':
           description: OK
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/TxOrRawTxWithMeta'
+                oneOf:
+                  - allOf:
+                    - $ref: '#/components/schemas/Tx'
+                    properties:
+                      meta:
+                        required: false
+                        $ref: '#/components/schemas/TxMeta'
+                  - allOf:
+                    - $ref: '#/components/schemas/RawTx'
+                    properties:
+                      meta:
+                        required: false
+                        $ref: '#/components/schemas/TxMeta'
+                    description: raw transaction
+                example:
+                  id: '0x4de71f2d588aa8a1ea00fe8312d92966da424d9939a511fc0be81e65fad52af8'
+                  chainTag: 1
+                  blockRef: '0x00000001511fc0be'
+                  expiration: 30
+                  clauses: []
+                  gasPriceCoef: 128
+                  gas: 21000
+                  origin: '0x7567d83b7b8d80addcb281a71d54fc7b3364ffed'
+                  delegator: null
+                  nonce: '0xd92966da424d9939'
+                  dependsOn: null
+                  size: 180
+                  meta:
+                    blockID: '0x00000001c458949985a6d86b7139690b8811dd3b4647c02d4f41cdefb7d32327'
+                    blockNumber: 1
+                    blockTimestamp: 1523156271
 
   /transactions/{id}/receipt:
     parameters:
@@ -174,7 +232,11 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Receipt'
+                allOf:
+                  - $ref: '#/components/schemas/Receipt'
+                properties:            
+                  meta:
+                    $ref: '#/components/schemas/ReceiptMeta'
 
   /transactions:
     post:
@@ -182,44 +244,80 @@ paths:
         - Transactions
       summary: Commit transaction
       description: |
-        in raw or structured format. If no signature in structured format,
-        `signingHash` is returned in response body.
+        in raw.
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/RawOrSignedOrUnsignedTx'
+              $ref: '#/components/schemas/RawTx'
       responses:
         '200':
           description: OK
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/IDOrSigningHash'
+                $ref: '#/components/schemas/TXID'
 
   /blocks/{revision}:
     parameters:
       - $ref: '#/components/parameters/RevisionInPath'
+      - $ref: '#/components/parameters/ExpandedInQuery'
     get:
       tags:
         - Blocks
       summary: Retrieve block
       description: |
-        by ID or number, or 'best' for latest block.
+        by ID or number, or 'best' for latest block. If `expanded` query option is true, all transactions along with
+        their receipts will be embedded under `transactions` field instead of ids.
       responses:
         '200':
           description: OK
           content:
             application/json:
               schema:
-                allOf:
-                  - $ref: '#/components/schemas/Block'
-                  - type: object
+                oneOf:
+                  - allOf:
+                    - $ref: '#/components/schemas/Block'
+                    - $ref: '#/components/schemas/IsTrunk'
                     properties:
-                      isTrunk:
-                        type: boolean
-                        description: whether the block is on th trunk
+                      transactions:
+                        description: transaction IDs                          
+                        type: array
+                        items:
+                          type: string
+                          example: '0x284bba50ef777889ff1a367ed0b38d5e5626714477c40de38d71cedd6f9fa477'
+                  - allOf:
+                    - $ref: '#/components/schemas/Block'
+                    - $ref: '#/components/schemas/IsTrunk'
+                    properties:
+                      transactions:
+                        description: embedded transactions along with their receipts
+                        type: array
+                        items:
+                          allOf:
+                            - $ref: '#/components/schemas/Tx'
+                            - $ref: '#/components/schemas/Receipt'
+                    description: expanded block
+
+              example:
+                number: 325324
+                id: '0x0004f6cc88bb4626a92907718e82f255b8fa511453a78e8797eb8cea3393b215'
+                size: 373
+                parentID: '0x0004f6cb730dbd90fed09d165bfdf33cc0eed47ec068938f6ee7b7c12a4ea98d'
+                timestamp: 1533267900
+                gasLimit: 11253579
+                beneficiary: '0xb4094c25f86d628fdd571afc4077f0d0196afb48'
+                gasUsed: 21000
+                totalScore: 1029988
+                txsRoot: '0x89dfd9fcd10c9e53d68592cf8b540b280b72d381b868523223992f3e09a806bb'
+                txsFeatures: 0
+                stateRoot: '0x86bcc6d214bc9d8d0dedba1012a63c8317d19ce97f60c8a2ef5c59bbd40d4261'
+                receiptsRoot: '0x15787e2533c470e8a688e6cd17a1ee12d8457778d5f82d2c109e2d6226d8e54e'
+                signer: '0xab7b27fc9e7d29f9f2e5bd361747a5515d0cc2d1'
+                isTrunk: true
+                transactions:
+                  - '0x284bba50ef777889ff1a367ed0b38d5e5626714477c40de38d71cedd6f9fa477'
 
   /logs/event:
     post:
@@ -228,8 +326,6 @@ paths:
       summary: Filter event logs
       description: |
         Event logs are produced by `OP_LOG` in EVM.
-      parameters:
-        - $ref: '#/components/parameters/FilterOrderInQuery'
       requestBody:
         required: true
         content:
@@ -246,10 +342,9 @@ paths:
                 items:
                   allOf:
                     - $ref: '#/components/schemas/Event'
-                    - type: object
-                      properties:
-                        meta:
-                          $ref: '#/components/schemas/LogMeta'
+                  properties:
+                    meta:
+                      $ref: '#/components/schemas/LogMeta'
 
   /logs/transfer:
     post:
@@ -258,8 +353,6 @@ paths:
       summary: Filter transfer logs
       description: |
         Transfer logs are recorded on VET transferring.
-      parameters:
-        - $ref: '#/components/parameters/FilterOrderInQuery'
       requestBody:
         required: true
         content:
@@ -276,137 +369,9 @@ paths:
                 items:
                   allOf:
                     - $ref: '#/components/schemas/Transfer'
-                    - type: object
-                      properties:
-                        meta:
-                          $ref: '#/components/schemas/LogMeta'                        
-
-  /logs/events:
-    post:
-      deprecated: true
-      tags:
-        - Logs
-      summary: Filter event logs
-      description: |
-        Event logs are produced by `OP_LOG` in EVM.
-      parameters:
-        - $ref: '#/components/parameters/FilterOrderInQuery'
-        - $ref: '#/components/parameters/FilterAddressInQuery'
-      requestBody:
-        description: event filter criteria
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/EventFilterLegacy'
-      responses:
-        '200':
-          description: OK
-          content:
-            application/json:
-              schema:
-                type: array
-                items:
-                  allOf:
-                    - $ref: '#/components/schemas/Event'
-                    - type: object
-                      properties:
-                        meta:
-                          $ref: '#/components/schemas/LogMeta'
-
-  /logs/transfers:
-    post:
-      deprecated: true
-      tags:
-        - Logs
-      summary: Filter transfer logs
-      description: |
-        Transfer logs are recorded on VET transferring.
-      parameters:
-        - $ref: '#/components/parameters/FilterOrderInQuery'
-      requestBody:
-        description: transfer log filter criteria
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/TransferFilterLegacy'
-      responses:
-        '200':
-          description: OK
-          content:
-            application/json:
-              schema:
-                type: array
-                items:
-                  allOf:
-                    - $ref: '#/components/schemas/Transfer'
-                    - type: object
-                      properties:
-                        meta:
-                          $ref: '#/components/schemas/LogMeta'
-                  
-
-  /events:
-    post:
-      deprecated: true
-      tags:
-        - Logs
-      summary: Filter event logs
-      parameters:
-        - $ref: '#/components/parameters/FilterOrderInQuery'
-        - $ref: '#/components/parameters/FilterAddressInQuery'
-      requestBody:
-        description: event filter criteria
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/EventFilterLegacy'
-      responses:
-        '200':
-          description: OK
-          content:
-            application/json:
-              schema:
-                type: array
-                items:
-                  allOf:
-                    - $ref: '#/components/schemas/Event'
-                    - type: object
-                      properties:
-                        meta:
-                          $ref: '#/components/schemas/LogMeta'
-
-  /transfers:
-    post:
-      deprecated: true
-      tags:
-        - Logs
-      summary: Filter transfer logs
-      parameters:
-        - $ref: '#/components/parameters/FilterOrderInQuery'
-      requestBody:
-        description: transfer log filter criteria
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/TransferFilterLegacy'
-      responses:
-        '200':
-          description: OK
-          content:
-            application/json:
-              schema:
-                type: array
-                items:
-                  allOf:
-                    - $ref: '#/components/schemas/Transfer'
-                    - type: object
-                      properties:
-                        meta:
-                          $ref: '#/components/schemas/LogMeta'
+                  properties:
+                    meta:
+                      $ref: '#/components/schemas/LogMeta'
 
   /node/network/peers:
     get:
@@ -439,7 +404,14 @@ paths:
                 allOf:
                   - $ref: '#/components/schemas/Block'
                   - $ref: '#/components/schemas/Obsolete'
-          
+                properties:
+                  transactions:
+                    description: transaction IDs
+                    type: array
+                    items:
+                      type: string
+                      example: '0x284bba50ef777889ff1a367ed0b38d5e5626714477c40de38d71cedd6f9fa477'
+
   /subscriptions/event:
     get:
       tags:
@@ -489,10 +461,9 @@ paths:
                 allOf:
                   - $ref: '#/components/schemas/Event'
                   - $ref: '#/components/schemas/Obsolete'
-                  - type: object
-                    properties:
-                      meta:
-                        $ref: '#/components/schemas/LogMeta'
+                properties:
+                  meta:
+                    $ref: '#/components/schemas/LogMeta'
                 
           
   /subscriptions/transfer:
@@ -528,10 +499,71 @@ paths:
                 allOf:
                     - $ref: '#/components/schemas/Transfer'
                     - $ref: '#/components/schemas/Obsolete'
-                    - type: object
-                      properties:
-                        meta:
-                          $ref: '#/components/schemas/LogMeta'
+                properties:
+                  meta:
+                    $ref: '#/components/schemas/LogMeta'
+
+  /subscriptions/beat:
+    get:
+      tags:
+        - Subscriptions
+      summary: (Websocket) Subscribe block chain's beats
+      description: |
+        which contain summary of new blocks, and bloom filters that composited with affected addresses.
+      parameters:
+        - $ref: '#/components/parameters/PositionInQuery'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                allOf:
+                    - $ref: '#/components/schemas/Beat'
+                    - $ref: '#/components/schemas/Obsolete'
+
+  /debug/tracers:
+    post:
+      tags:
+        - Debug
+      summary: Create a tracer
+      description:
+        for a clause
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TracerOption'      
+
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+
+  /debug/storage-range:
+    post:
+      tags:
+        - Debug
+      summary: Retrieve storage range
+      description: |
+        of the account with given address
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StorageRangeOption'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StorageRange'
 
 components:
   schemas:
@@ -580,6 +612,32 @@ components:
           description: block unix timestamp
           example: 1533267900
 
+    ReceiptMeta:
+      description: tx receipt meta info
+      properties:
+        blockID:
+          type: string
+          description: block identifier (bytes32)
+          example: '0x0004f6cc88bb4626a92907718e82f255b8fa511453a78e8797eb8cea3393b215'
+        blockNumber:
+          type: integer
+          format: uint32
+          description: block number (height)
+          example: 325324
+        blockTimestamp:
+          type: integer
+          format: uint64
+          description: block unix timestamp
+          example: 1533267900
+        txID:
+          type: string
+          description: transaction identifier
+          example: '0x284bba50ef777889ff1a367ed0b38d5e5626714477c40de38d71cedd6f9fa477'
+        txOrigin:
+          type: string
+          description: transaction origin (signer)
+          example: '0xdb4027477b2a8fe4c83c6dafe7f86678bb1b8a8d'
+
     LogMeta:
       description: event or transfer log meta info
       properties:
@@ -605,6 +663,11 @@ components:
           type: string
           description: transaction origin (signer)
           example: '0xdb4027477b2a8fe4c83c6dafe7f86678bb1b8a8d'
+        clauseIndex:
+          type: integer
+          format: uint32
+          description: index of clause which generates this log
+          example: 0
 
     Block:
       properties:
@@ -658,6 +721,11 @@ components:
           format: bytes32
           description: root hash of transactions in the block 
           example: '0x89dfd9fcd10c9e53d68592cf8b540b280b72d381b868523223992f3e09a806bb'
+        txsFeatures:
+          type: integer
+          format: uint32
+          description: supported txs features bitset
+          example: 0
         stateRoot:
           type: string
           format: bytes32
@@ -673,14 +741,6 @@ components:
           format: bytes20
           description: the one who signed this block
           example: '0xab7b27fc9e7d29f9f2e5bd361747a5515d0cc2d1'
-        transactions:
-          type: array
-          description: transactions IDs
-          items:
-            type: string
-            format: bytes32
-            description: transaction ID
-            example: '0x284bba50ef777889ff1a367ed0b38d5e5626714477c40de38d71cedd6f9fa477'
 
     Clause:
       properties:
@@ -697,8 +757,25 @@ components:
           description: input data (bytes)
           example: '0x'
 
-    TxBody:
+    Tx:
       properties:
+        id:
+          type: string
+          description: identifier of the transaction
+          example: '0x284bba50ef777889ff1a367ed0b38d5e5626714477c40de38d71cedd6f9fa477'
+        origin:
+          type: string
+          description: the one who signed the transaction
+          example: '0xdb4027477b2a8fe4c83c6dafe7f86678bb1b8a8d'
+        delegator:
+          type: string
+          description: the delegator who paid the gas fee
+          example: null
+        size:
+          type: integer
+          format: uint32
+          description: byte size of the transaction that is RLP encoded
+          example: 130
         chainTag:
           type: integer
           format: uint8
@@ -736,36 +813,6 @@ components:
           type: string
           example: '0x29c257e36ea6e72a'
 
-    SignedTx:
-      allOf:
-        - $ref: '#/components/schemas/TxBody'
-        - type: object
-          properties:
-            signature:
-              type: string
-              description: signature hex string
-              example: '0x67cd851b90fb016457bb30ccbdaa3405f3db667daeb95258e1859c545be30c10f1780476f7c6ba24c75d26c8f1a9df59fe89b105c6f86733c1d5c1c74f14cd9201'
-
-    TxWithMeta:
-      allOf:
-        - $ref: '#/components/schemas/TxBody'
-        - type: object
-          properties:
-            id:
-              type: string
-              description: identifier of the transaction
-              example: '0x284bba50ef777889ff1a367ed0b38d5e5626714477c40de38d71cedd6f9fa477'
-            origin:
-              type: string
-              description: the one who signed the transaction
-              example: '0xdb4027477b2a8fe4c83c6dafe7f86678bb1b8a8d'
-            size:
-              type: integer
-              format: uint32
-              description: byte size of the transaction that is RLP encoded
-              example: 130
-            meta:
-              $ref: '#/components/schemas/TxMeta'
 
     RawTx:
       properties:
@@ -773,15 +820,6 @@ components:
           type: string
           description: hex form of encoded transaction
           example: '0xf86981ba800adad994000000000000000000000000000000000000746f82271080018252088001c0b8414792c9439594098323900e6470742cd877ec9f9906bca05510e421f3b013ed221324e77ca10d3466b32b1800c72e12719b213f1d4c370305399dd27af962626400'
-
-    RawTxWithMeta:
-      properties:
-        raw:
-          type: string
-          description: hex form of encoded transaction
-          example: '0xf86981ba800adad994000000000000000000000000000000000000746f82271080018252088001c0b8414792c9439594098323900e6470742cd877ec9f9906bca05510e421f3b013ed221324e77ca10d3466b32b1800c72e12719b213f1d4c370305399dd27af962626400'
-        meta:
-          $ref: '#/components/schemas/TxMeta'
 
     Event:
       properties:
@@ -853,8 +891,6 @@ components:
                 type: array
                 items:
                   $ref: '#/components/schemas/Transfer'
-        meta:
-          $ref: '#/components/schemas/LogMeta'
 
     CallData:
       properties:
@@ -903,6 +939,54 @@ components:
         vmError:
           type: string
           example: ''
+
+    BatchCallData:
+      properties:
+        clauses:
+          type: array
+          items:
+            $ref: '#/components/schemas/Clause'
+        gas:
+          type: integer
+          format: uint64
+          description: max allowed gas for execution
+        gasPrice:
+          type: string
+          description: absolute gas price
+        caller:
+          type: string
+          description: caller address (msg.sender)
+        provedWork:
+          type: string
+          description: tx proved work(for extension contract)
+        gasPayer:
+          type: string
+          description: gas payer(for extension contract)
+        expiration:
+          type: integer
+          format: uint32
+          description: tx expiration(for extension contract)
+        blockRef:
+          type: string
+          description: block reference(for extension contract)
+      example:
+        clauses:
+          - to: '0x5034aa590125b64023a0262112b98d72e3c8e40e'
+            value: '0xde0b6b3a7640000'
+            data: '0x5665436861696e2054686f72' 
+        gas: 50000
+        gasPrice: '1000000000000000'
+        caller: '0x7567d83b7b8d80addcb281a71d54fc7b3364ffed'
+        provedWork: '1000'
+        gasPayer: '0xd3ae78222beadb038203be21ed5ce7c9b1bff602'
+        expiration: 1000
+        blockRef: '0x00000000851caf3c'
+        
+    BatchCallResult:
+      type: array
+      items:
+        $ref: '#/components/schemas/CallResult'
+
 
     FilterOptions:
       properties:
@@ -965,65 +1049,6 @@ components:
         ```
         refers to the range from block 10 to block 1000.
         `null` stands for the full range.
-        
-
-    TopicSetLegacy:
-      properties:
-        topic0:
-          type: string
-        topic1:
-          type: string
-        topic2:
-          type: string
-        topic3:
-          type: string
-        topic4:
-          type: string
-      description: |
-        a set of topics joined with `and` operand. `null` topics are ignored. e.g. 
-        ```
-        {
-          "topic0": "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef",
-          "topic1": null
-        }
-        ```
-        matches events whose `topic0` equals `0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef`.
-      example:
-        topic0: '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef'
-
-    EventFilterLegacy:
-      properties:
-        range:
-          $ref: '#/components/schemas/FilterRange'
-        options:
-          $ref: '#/components/schemas/FilterOptions'
-        topicSets:
-          type: array
-          items:
-            $ref: '#/components/schemas/TopicSetLegacy'
-
-    AddressSetLegacy:
-      properties:
-        txOrigin:
-          type: string
-          example: '0xe59d475abe695c7f67a8a2321f33a856b0b4c71d'
-        sender:
-          type: string
-          example: '0xe59d475abe695c7f67a8a2321f33a856b0b4c71d'
-        recipient:
-          type: string
-          example: '0x7567d83b7b8d80addcb281a71d54fc7b3364ffed'
-
-    TransferFilterLegacy:
-      properties:
-        range:
-          $ref: '#/components/schemas/FilterRange'
-        options:
-          $ref: '#/components/schemas/FilterOptions'
-        addressSets:
-          type: array
-          items:
-            $ref: '#/components/schemas/AddressSetLegacy'
             
     EventCriteria:
       properties:
@@ -1041,17 +1066,18 @@ components:
         topic4:
           type: string
       description: |
-        criteria to filter out event. All fields are joined with `and` operand. `null` field are ignored. e.g. 
+        criteria to filter out event. All fields are joined with `and` operator. `null` field are ignored. e.g. 
         ```
         {
-          "address": "0xe59d475abe695c7f67a8a2321f33a856b0b4c71d",
+          "address": "0x0000000000000000000000000000456E65726779",
           "topic0": "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
         }
         ```
         matches events emitted by `0xe59d475abe695c7f67a8a2321f33a856b0b4c71d` and with `topic0` equals `0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef`.
       example:
-        address: "0xe59d475abe695c7f67a8a2321f33a856b0b4c71d"
+        address: "0x0000000000000000000000000000456E65726779"
         topic0: '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef'
+        topic1: '0x0000000000000000000000005034aa590125b64023a0262112b98d72e3c8e40e'
             
     EventFilter:
       properties:
@@ -1063,6 +1089,13 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/EventCriteria'
+        order:
+          description: |
+            order of filters, defaults to `asc`
+          type: string
+          enum:
+            - asc
+            - desc
             
     TransferCriteria:
       properties:
@@ -1086,6 +1119,13 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/TransferCriteria'
+        order:
+          description: |
+            order of filters, defaults to `asc`
+          type: string
+          enum:
+            - asc
+            - desc
     
     PeerStats:
       properties:
@@ -1111,45 +1151,10 @@ components:
           type: integer
           example: 28
 
-    TxOrRawTxWithMeta:
-      oneOf:
-        - $ref: '#/components/schemas/TxWithMeta'
-        - $ref: '#/components/schemas/RawTxWithMeta'
-      example:
-        id: '0x4de71f2d588aa8a1ea00fe8312d92966da424d9939a511fc0be81e65fad52af8'
-        chainTag: 1
-        blockRef: '0x00000001511fc0be'
-        expiration: 30
-        clauses: []
-        gasPriceCoef: 128
-        gas: 21000
-        origin: '0x7567d83b7b8d80addcb281a71d54fc7b3364ffed'
-        nonce: '0xd92966da424d9939'
-        dependsOn: null
-        size: 180
-        meta:
-          blockID: '0x00000001c458949985a6d86b7139690b8811dd3b4647c02d4f41cdefb7d32327'
-          blockNumber: 1
-          blockTimestamp: 1523156271
-
-    RawOrSignedOrUnsignedTx:
-      oneOf:
-        - $ref: '#/components/schemas/RawTx'
-        - $ref: '#/components/schemas/SignedTx'
-        - $ref: '#/components/schemas/TxBody'
-      example:
-        raw: '0xf86981ba800adad994000000000000000000000000000000000000746f82271080018252088001c0b8414792c9439594098323900e6470742cd877ec9f9906bca05510e421f3b013ed221324e77ca10d3466b32b1800c72e12719b213f1d4c370305399dd27af962626400'
-
-    IDOrSigningHash:
-      oneOf:
-        - type: object
-          properties:
-            id:
-              type: string
-        - type: object
-          properties:
-            signingHash:
-              type: string
+    TXID:
+      properties:
+        id:
+          type: string
       example:
         id: '0x4de71f2d588aa8a1ea00fe8312d92966da424d9939a511fc0be81e65fad52af8'
     
@@ -1160,6 +1165,108 @@ components:
           type: boolean
           description: |
             indicates whether the block containing this data become branch block
+
+    TracerOption:
+      properties:
+        name:
+          type: string
+          enum:
+            - 4byte
+            - bigram
+            - call
+            - evmdis
+            - noop
+            - opcount
+            - prestate
+            - trigram
+            - unigram
+          description: |
+            name of tracer. Empty name stands for default struct logger tracer.
+          example: ""
+        target:
+          type: string
+          description: |
+            the unified path of target to be traced.
+            Currently, only clause is supported. Format:
+            `blockID/(txIndex|txId)/clauseIndex`
+          example: '0x000dabb4d6f0a80ad7ad7cd0e07a1f20b546db0730d869d5ccb0dd2a16e7595b/0/0'
+
+    StorageRangeOption:
+      properties:
+        address:
+          type: string
+          description: |
+            address of account
+          example: '0xa4627036e2095eb71c2341054daa63577c062498'
+        keyStart:
+          type: string
+          example: '0x0000000000000000000000000000000000000000000000000000000000000000'
+        maxResult:
+          type: number
+          example: 10
+        target:
+          type: string
+          example: '0x000edefb448685f9c72fc2b946980ef51d8d208bbaa4d3fdcf0c57d4847aca2e/0/0'
+
+    StorageRange:
+      properties:
+        nextKey:
+          type: string
+          example:
+            null
+        storage:
+          type: object
+          example:
+            '0x33e423980c9b37d048bd5fadbd4a2aeb95146922045405accc2f468d0ef96988':
+              key:
+                '0x0000000000000000000000000000000000000000000000000000000000000001'
+              value:
+                '0x00000000000000000000000000000000000000000000000000000000000000c8'
+    Beat:
+      properties:
+        number:
+          type: integer
+          format: uint32
+          description: block number (height)
+          example: 325324
+        id:
+          type: string
+          format: bytes32
+          description: block identifier
+          example: '0x0004f6cc88bb4626a92907718e82f255b8fa511453a78e8797eb8cea3393b215'
+        parentID:
+          type: string
+          format: bytes32
+          description: parent block ID
+          example: '0x0004f6cb730dbd90fed09d165bfdf33cc0eed47ec068938f6ee7b7c12a4ea98d'
+        timestamp:
+          type: integer
+          format: uint64
+          description: block unix timestamp
+          example: 1533267900
+        txsFeatures:
+          type: integer
+          format: uint32
+          description: supported txs features bitset
+          example: 0
+        bloom:
+          type: string
+          format: hex
+          description: |
+            the bloom filter composited with affected addresses
+          example: '0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000'
+        k:
+          type: integer
+          format: uint32
+          description: |
+            the number of hash functions for bloom filter
+          example: 3          
+
+    IsTrunk:
+      properties:
+        isTrunk:
+          type: boolean
+          description: whether the block is on th trunk
 
   parameters:
     AddressInPath:
@@ -1251,4 +1358,21 @@ components:
         a saved block ID for resuming the subscription. best block ID is assumed if omitted.
       schema:
         type: string
-      
+
+    ExpandedInQuery:
+      name: expanded
+      in: query
+      required: false
+      description: |
+        whether the returned block is expanded.
+      schema:
+        type: boolean
+
+    PendingInQuery:
+      name: pending
+      in: query
+      required: false
+      description: |
+        whether to return tx, even it's pending
+      schema:
+        type: boolean

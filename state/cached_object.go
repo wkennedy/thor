@@ -7,58 +7,57 @@ package state
 
 import (
 	"github.com/ethereum/go-ethereum/rlp"
-	"github.com/vechain/thor/kv"
+	lru "github.com/hashicorp/golang-lru"
+	"github.com/vechain/thor/muxdb"
 	"github.com/vechain/thor/thor"
 )
 
+var codeCache, _ = lru.NewARC(512)
+
 // cachedObject to cache code and storage of an account.
 type cachedObject struct {
-	kv   kv.GetPutter
+	db   *muxdb.MuxDB
+	addr thor.Address
 	data Account
 
 	cache struct {
 		code        []byte
-		storageTrie trieReader
+		storageTrie *muxdb.Trie
 		storage     map[thor.Bytes32]rlp.RawValue
 	}
 }
 
-func newCachedObject(kv kv.GetPutter, data *Account) *cachedObject {
-	return &cachedObject{kv: kv, data: *data}
+func newCachedObject(db *muxdb.MuxDB, addr thor.Address, data *Account) *cachedObject {
+	return &cachedObject{db: db, addr: addr, data: *data}
 }
 
-func (co *cachedObject) getOrCreateStorageTrie() (trieReader, error) {
+func (co *cachedObject) getOrCreateStorageTrie() *muxdb.Trie {
 	if co.cache.storageTrie != nil {
-		return co.cache.storageTrie, nil
+		return co.cache.storageTrie
 	}
 
-	root := thor.BytesToBytes32(co.data.StorageRoot)
+	trie := co.db.NewSecureTrie(
+		StorageTrieName(thor.Blake2b(co.addr[:])),
+		thor.BytesToBytes32(co.data.StorageRoot))
 
-	trie, err := trCache.Get(root, co.kv, false)
-	if err != nil {
-		return nil, err
-	}
 	co.cache.storageTrie = trie
-	return trie, nil
+	return trie
 }
 
 // GetStorage returns storage value for given key.
 func (co *cachedObject) GetStorage(key thor.Bytes32) (rlp.RawValue, error) {
 	cache := &co.cache
 	// retrive from storage cache
-	if cache.storage == nil {
-		cache.storage = make(map[thor.Bytes32]rlp.RawValue)
-	} else {
+	if cache.storage != nil {
 		if v, ok := cache.storage[key]; ok {
 			return v, nil
 		}
+	} else {
+		cache.storage = make(map[thor.Bytes32]rlp.RawValue)
 	}
 	// not found in cache
 
-	trie, err := co.getOrCreateStorageTrie()
-	if err != nil {
-		return nil, err
-	}
+	trie := co.getOrCreateStorageTrie()
 
 	// load from trie
 	v, err := loadStorage(trie, key)
@@ -80,10 +79,15 @@ func (co *cachedObject) GetCode() ([]byte, error) {
 
 	if len(co.data.CodeHash) > 0 {
 		// do have code
-		code, err := co.kv.Get(co.data.CodeHash)
+		if code, has := codeCache.Get(string(co.data.CodeHash)); has {
+			return code.([]byte), nil
+		}
+
+		code, err := co.db.NewStore(codeStoreName).Get(co.data.CodeHash)
 		if err != nil {
 			return nil, err
 		}
+		codeCache.Add(string(co.data.CodeHash), code)
 		cache.code = code
 		return code, nil
 	}

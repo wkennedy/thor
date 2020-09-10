@@ -8,7 +8,6 @@ package consensus
 import (
 	"fmt"
 
-	"github.com/pkg/errors"
 	"github.com/vechain/thor/block"
 	"github.com/vechain/thor/builtin"
 	"github.com/vechain/thor/poa"
@@ -31,7 +30,8 @@ func (c *Consensus) validate(
 		return nil, nil, err
 	}
 
-	if err := c.validateProposer(header, parentHeader, state); err != nil {
+	candidates, err := c.validateProposer(header, parentHeader, state)
+	if err != nil {
 		return nil, nil, err
 	}
 
@@ -44,6 +44,47 @@ func (c *Consensus) validate(
 		return nil, nil, err
 	}
 
+	hasAuthorityEvent := func() bool {
+		for _, r := range receipts {
+			for _, o := range r.Outputs {
+				for _, ev := range o.Events {
+					if ev.Address == builtin.Authority.Address {
+						return true
+					}
+				}
+			}
+		}
+		return false
+	}()
+
+	// if no event emitted from Authority contract, it's believed that the candidates list not changed
+	if !hasAuthorityEvent {
+
+		// if no endorsor related transfer, or no event emitted from Params contract, the proposers list
+		// can be reused
+		hasEndorsorEvent := func() bool {
+			for _, r := range receipts {
+				for _, o := range r.Outputs {
+					for _, ev := range o.Events {
+						if ev.Address == builtin.Params.Address {
+							return true
+						}
+					}
+					for _, t := range o.Transfers {
+						if candidates.IsEndorsor(t.Sender) || candidates.IsEndorsor(t.Recipient) {
+							return true
+						}
+					}
+				}
+			}
+			return false
+		}()
+
+		if hasEndorsorEvent {
+			candidates.InvalidateCache()
+		}
+		c.candidatesCache.Add(header.ID(), candidates)
+	}
 	return stage, receipts, nil
 }
 
@@ -71,47 +112,57 @@ func (c *Consensus) validateBlockHeader(header *block.Header, parent *block.Head
 	if header.TotalScore() <= parent.TotalScore() {
 		return consensusError(fmt.Sprintf("block total score invalid: parent %v, current %v", parent.TotalScore(), header.TotalScore()))
 	}
-
 	return nil
 }
 
-func (c *Consensus) validateProposer(header *block.Header, parent *block.Header, st *state.State) error {
+func (c *Consensus) validateProposer(header *block.Header, parent *block.Header, st *state.State) (*poa.Candidates, error) {
 	signer, err := header.Signer()
 	if err != nil {
-		return consensusError(fmt.Sprintf("block signer unavailable: %v", err))
+		return nil, consensusError(fmt.Sprintf("block signer unavailable: %v", err))
 	}
 
 	authority := builtin.Authority.Native(st)
-	endorsement := builtin.Params.Native(st).Get(thor.KeyProposerEndorsement)
+	var candidates *poa.Candidates
+	if entry, ok := c.candidatesCache.Get(parent.ID()); ok {
+		candidates = entry.(*poa.Candidates).Copy()
+	} else {
+		list, err := authority.AllCandidates()
+		if err != nil {
+			return nil, err
+		}
+		candidates = poa.NewCandidates(list)
+	}
 
-	candidates := authority.Candidates(endorsement, thor.MaxBlockProposers)
-	proposers := make([]poa.Proposer, 0, len(candidates))
-	for _, c := range candidates {
-		proposers = append(proposers, poa.Proposer{
-			Address: c.NodeMaster,
-			Active:  c.Active,
-		})
+	proposers, err := candidates.Pick(st)
+	if err != nil {
+		return nil, err
 	}
 
 	sched, err := poa.NewScheduler(signer, proposers, parent.Number(), parent.Timestamp())
 	if err != nil {
-		return consensusError(fmt.Sprintf("block signer invalid: %v %v", signer, err))
+		return nil, consensusError(fmt.Sprintf("block signer invalid: %v %v", signer, err))
 	}
 
 	if !sched.IsTheTime(header.Timestamp()) {
-		return consensusError(fmt.Sprintf("block timestamp unscheduled: t %v, s %v", header.Timestamp(), signer))
+		return nil, consensusError(fmt.Sprintf("block timestamp unscheduled: t %v, s %v", header.Timestamp(), signer))
 	}
 
 	updates, score := sched.Updates(header.Timestamp())
 	if parent.TotalScore()+score != header.TotalScore() {
-		return consensusError(fmt.Sprintf("block total score invalid: want %v, have %v", parent.TotalScore()+score, header.TotalScore()))
+		return nil, consensusError(fmt.Sprintf("block total score invalid: want %v, have %v", parent.TotalScore()+score, header.TotalScore()))
 	}
 
-	for _, proposer := range updates {
-		authority.Update(proposer.Address, proposer.Active)
+	for _, u := range updates {
+		if _, err := authority.Update(u.Address, u.Active); err != nil {
+			return nil, err
+		}
+		if !candidates.Update(u.Address, u.Active) {
+			// should never happen
+			panic("something wrong with candidates list")
+		}
 	}
 
-	return nil
+	return candidates, nil
 }
 
 func (c *Consensus) validateBlockBody(blk *block.Block) error {
@@ -122,19 +173,26 @@ func (c *Consensus) validateBlockBody(blk *block.Block) error {
 	}
 
 	for _, tx := range txs {
-		if _, err := tx.Signer(); err != nil {
+		origin, err := tx.Origin()
+		if err != nil {
 			return consensusError(fmt.Sprintf("tx signer unavailable: %v", err))
 		}
 
+		if header.Number() >= c.forkConfig.BLOCKLIST && thor.IsOriginBlocked(origin) {
+			return consensusError(fmt.Sprintf("tx origin blocked got packed: %v", origin))
+		}
+
 		switch {
-		case tx.ChainTag() != c.chain.Tag():
-			return consensusError(fmt.Sprintf("tx chain tag mismatch: want %v, have %v", c.chain.Tag(), tx.ChainTag()))
+		case tx.ChainTag() != c.repo.ChainTag():
+			return consensusError(fmt.Sprintf("tx chain tag mismatch: want %v, have %v", c.repo.ChainTag(), tx.ChainTag()))
 		case header.Number() < tx.BlockRef().Number():
 			return consensusError(fmt.Sprintf("tx ref future block: ref %v, current %v", tx.BlockRef().Number(), header.Number()))
 		case tx.IsExpired(header.Number()):
 			return consensusError(fmt.Sprintf("tx expired: ref %v, current %v, expiration %v", tx.BlockRef().Number(), header.Number(), tx.Expiration()))
-		case tx.HasReservedFields():
-			return consensusError(fmt.Sprintf("tx reserved fields not empty"))
+		}
+
+		if err := tx.TestFeatures(header.TxsFeatures()); err != nil {
+			return consensusError("invalid tx: " + err.Error())
 		}
 	}
 
@@ -148,8 +206,10 @@ func (c *Consensus) verifyBlock(blk *block.Block, state *state.State) (*state.St
 	processedTxs := make(map[thor.Bytes32]bool)
 	header := blk.Header()
 	signer, _ := header.Signer()
+	chain := c.repo.NewChain(header.ParentID())
+
 	rt := runtime.New(
-		c.chain.NewSeeker(header.ParentID()),
+		chain,
 		state,
 		&xenv.BlockContext{
 			Beneficiary: header.Beneficiary(),
@@ -158,15 +218,17 @@ func (c *Consensus) verifyBlock(blk *block.Block, state *state.State) (*state.St
 			Time:        header.Timestamp(),
 			GasLimit:    header.GasLimit(),
 			TotalScore:  header.TotalScore(),
-		})
+		},
+		c.forkConfig)
 
 	findTx := func(txID thor.Bytes32) (found bool, reverted bool, err error) {
 		if reverted, ok := processedTxs[txID]; ok {
 			return true, reverted, nil
 		}
-		meta, err := c.chain.GetTransactionMeta(txID, header.ParentID())
+
+		meta, err := chain.GetTransactionMeta(txID)
 		if err != nil {
-			if c.chain.IsNotFound(err) {
+			if chain.IsNotFound(err) {
 				return false, false, nil
 			}
 			return false, false, err
@@ -213,18 +275,16 @@ func (c *Consensus) verifyBlock(blk *block.Block, state *state.State) (*state.St
 
 	receiptsRoot := receipts.RootHash()
 	if header.ReceiptsRoot() != receiptsRoot {
-		return nil, nil, consensusError(fmt.Sprintf("block receipts root mismatch: want %v, have %v", header.ReceiptsRoot(), receiptsRoot))
+		if c.correctReceiptsRoots[header.ID().String()] != receiptsRoot.String() {
+			return nil, nil, consensusError(fmt.Sprintf("block receipts root mismatch: want %v, have %v", header.ReceiptsRoot(), receiptsRoot))
+		}
 	}
 
-	if err := rt.Seeker().Err(); err != nil {
-		return nil, nil, errors.WithMessage(err, "chain")
-	}
-
-	stage := state.Stage()
-	stateRoot, err := stage.Hash()
+	stage, err := state.Stage()
 	if err != nil {
 		return nil, nil, err
 	}
+	stateRoot := stage.Hash()
 
 	if blk.Header().StateRoot() != stateRoot {
 		return nil, nil, consensusError(fmt.Sprintf("block state root mismatch: want %v, have %v", header.StateRoot(), stateRoot))

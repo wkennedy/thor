@@ -26,6 +26,7 @@ type BlockMessage struct {
 	GasUsed      uint64         `json:"gasUsed"`
 	TotalScore   uint64         `json:"totalScore"`
 	TxsRoot      thor.Bytes32   `json:"txsRoot"`
+	TxsFeatures  uint32         `json:"txsFeatures"`
 	StateRoot    thor.Bytes32   `json:"stateRoot"`
 	ReceiptsRoot thor.Bytes32   `json:"receiptsRoot"`
 	Signer       thor.Address   `json:"signer"`
@@ -33,7 +34,7 @@ type BlockMessage struct {
 	Obsolete     bool           `json:"obsolete"`
 }
 
-func convertBlock(b *chain.Block) (*BlockMessage, error) {
+func convertBlock(b *chain.ExtendedBlock) (*BlockMessage, error) {
 	header := b.Header()
 	signer, err := header.Signer()
 	if err != nil {
@@ -59,6 +60,7 @@ func convertBlock(b *chain.Block) (*BlockMessage, error) {
 		StateRoot:    header.StateRoot(),
 		ReceiptsRoot: header.ReceiptsRoot(),
 		TxsRoot:      header.TxsRoot(),
+		TxsFeatures:  uint32(header.TxsFeatures()),
 		Transactions: txIds,
 		Obsolete:     b.Obsolete,
 	}, nil
@@ -70,6 +72,7 @@ type LogMeta struct {
 	BlockTimestamp uint64       `json:"blockTimestamp"`
 	TxID           thor.Bytes32 `json:"txID"`
 	TxOrigin       thor.Address `json:"txOrigin"`
+	ClauseIndex    uint32       `json:"clauseIndex"`
 }
 
 //TransferMessage transfer piped by websocket
@@ -81,8 +84,8 @@ type TransferMessage struct {
 	Obsolete  bool                  `json:"obsolete"`
 }
 
-func convertTransfer(header *block.Header, tx *tx.Transaction, transfer *tx.Transfer, obsolete bool) (*TransferMessage, error) {
-	signer, err := tx.Signer()
+func convertTransfer(header *block.Header, tx *tx.Transaction, clauseIndex uint32, transfer *tx.Transfer, obsolete bool) (*TransferMessage, error) {
+	origin, err := tx.Origin()
 	if err != nil {
 		return nil, err
 	}
@@ -96,7 +99,8 @@ func convertTransfer(header *block.Header, tx *tx.Transaction, transfer *tx.Tran
 			BlockNumber:    header.Number(),
 			BlockTimestamp: header.Timestamp(),
 			TxID:           tx.ID(),
-			TxOrigin:       signer,
+			TxOrigin:       origin,
+			ClauseIndex:    clauseIndex,
 		},
 		Obsolete: obsolete,
 	}, nil
@@ -111,8 +115,8 @@ type EventMessage struct {
 	Obsolete bool           `json:"obsolete"`
 }
 
-func convertEvent(header *block.Header, tx *tx.Transaction, event *tx.Event, obsolete bool) (*EventMessage, error) {
-	signer, err := tx.Signer()
+func convertEvent(header *block.Header, tx *tx.Transaction, clauseIndex uint32, event *tx.Event, obsolete bool) (*EventMessage, error) {
+	signer, err := tx.Origin()
 	if err != nil {
 		return nil, err
 	}
@@ -125,6 +129,7 @@ func convertEvent(header *block.Header, tx *tx.Transaction, event *tx.Event, obs
 			BlockTimestamp: header.Timestamp(),
 			TxID:           tx.ID(),
 			TxOrigin:       signer,
+			ClauseIndex:    clauseIndex,
 		},
 		Topics:   event.Topics,
 		Obsolete: obsolete,
@@ -188,4 +193,15 @@ func (tf *TransferFilter) Match(transfer *tx.Transfer, origin thor.Address) bool
 		return false
 	}
 	return true
+}
+
+type BeatMessage struct {
+	Number      uint32       `json:"number"`
+	ID          thor.Bytes32 `json:"id"`
+	ParentID    thor.Bytes32 `json:"parentID"`
+	Timestamp   uint64       `json:"timestamp"`
+	TxsFeatures uint32       `json:"txsFeatures"`
+	Bloom       string       `json:"bloom"`
+	K           uint32       `json:"k"`
+	Obsolete    bool         `json:"obsolete"`
 }

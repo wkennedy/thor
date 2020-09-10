@@ -11,16 +11,16 @@ import (
 )
 
 type eventReader struct {
-	chain       *chain.Chain
+	repo        *chain.Repository
 	filter      *EventFilter
 	blockReader chain.BlockReader
 }
 
-func newEventReader(chain *chain.Chain, position thor.Bytes32, filter *EventFilter) *eventReader {
+func newEventReader(repo *chain.Repository, position thor.Bytes32, filter *EventFilter) *eventReader {
 	return &eventReader{
-		chain:       chain,
+		repo:        repo,
 		filter:      filter,
-		blockReader: chain.NewBlockReader(position),
+		blockReader: repo.NewBlockReader(position),
 	}
 }
 
@@ -31,16 +31,16 @@ func (er *eventReader) Read() ([]interface{}, bool, error) {
 	}
 	var msgs []interface{}
 	for _, block := range blocks {
-		receipts, err := er.chain.GetBlockReceipts(block.Header().ID())
+		receipts, err := er.repo.GetBlockReceipts(block.Header().ID())
 		if err != nil {
 			return nil, false, err
 		}
 		txs := block.Transactions()
 		for i, receipt := range receipts {
-			for _, output := range receipt.Outputs {
+			for j, output := range receipt.Outputs {
 				for _, event := range output.Events {
 					if er.filter.Match(event) {
-						msg, err := convertEvent(block.Header(), txs[i], event, block.Obsolete)
+						msg, err := convertEvent(block.Header(), txs[i], uint32(j), event, block.Obsolete)
 						if err != nil {
 							return nil, false, err
 						}

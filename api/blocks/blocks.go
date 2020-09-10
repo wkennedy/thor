@@ -13,18 +13,17 @@ import (
 	"github.com/gorilla/mux"
 	"github.com/pkg/errors"
 	"github.com/vechain/thor/api/utils"
-	"github.com/vechain/thor/block"
 	"github.com/vechain/thor/chain"
 	"github.com/vechain/thor/thor"
 )
 
 type Blocks struct {
-	chain *chain.Chain
+	repo *chain.Repository
 }
 
-func New(chain *chain.Chain) *Blocks {
+func New(repo *chain.Repository) *Blocks {
 	return &Blocks{
-		chain,
+		repo,
 	}
 }
 
@@ -33,22 +32,44 @@ func (b *Blocks) handleGetBlock(w http.ResponseWriter, req *http.Request) error 
 	if err != nil {
 		return utils.BadRequest(errors.WithMessage(err, "revision"))
 	}
-	block, err := b.getBlock(revision)
+	expanded := req.URL.Query().Get("expanded")
+	if expanded != "" && expanded != "false" && expanded != "true" {
+		return utils.BadRequest(errors.WithMessage(errors.New("should be boolean"), "expanded"))
+	}
+
+	summary, err := b.getBlockSummary(revision)
 	if err != nil {
-		if b.chain.IsNotFound(err) {
+		if b.repo.IsNotFound(err) {
 			return utils.WriteJSON(w, nil)
 		}
 		return err
 	}
-	isTrunk, err := b.isTrunk(block.Header().ID(), block.Header().Number())
+	isTrunk, err := b.isTrunk(summary.Header.ID(), summary.Header.Number())
 	if err != nil {
 		return err
 	}
-	blk, err := convertBlock(block, isTrunk)
-	if err != nil {
-		return err
+
+	jSummary := buildJSONBlockSummary(summary, isTrunk)
+	if expanded == "true" {
+		txs, err := b.repo.GetBlockTransactions(summary.Header.ID())
+		if err != nil {
+			return err
+		}
+		receipts, err := b.repo.GetBlockReceipts(summary.Header.ID())
+		if err != nil {
+			return err
+		}
+
+		return utils.WriteJSON(w, &JSONExpandedBlock{
+			jSummary,
+			buildJSONEmbeddedTxs(txs, receipts),
+		})
 	}
-	return utils.WriteJSON(w, blk)
+
+	return utils.WriteJSON(w, &JSONCollapsedBlock{
+		jSummary,
+		summary.Txs,
+	})
 }
 
 func (b *Blocks) parseRevision(revision string) (interface{}, error) {
@@ -72,24 +93,28 @@ func (b *Blocks) parseRevision(revision string) (interface{}, error) {
 	return uint32(n), err
 }
 
-func (b *Blocks) getBlock(revision interface{}) (*block.Block, error) {
+func (b *Blocks) getBlockSummary(revision interface{}) (s *chain.BlockSummary, err error) {
+	var id thor.Bytes32
 	switch revision.(type) {
 	case thor.Bytes32:
-		return b.chain.GetBlock(revision.(thor.Bytes32))
+		id = revision.(thor.Bytes32)
 	case uint32:
-		return b.chain.GetTrunkBlock(revision.(uint32))
+		id, err = b.repo.NewBestChain().GetBlockID(revision.(uint32))
+		if err != nil {
+			return
+		}
 	default:
-		return b.chain.BestBlock(), nil
+		id = b.repo.BestBlock().Header().ID()
 	}
+	return b.repo.GetBlockSummary(id)
 }
 
 func (b *Blocks) isTrunk(blkID thor.Bytes32, blkNum uint32) (bool, error) {
-	best := b.chain.BestBlock()
-	ancestorID, err := b.chain.GetAncestorBlockID(best.Header().ID(), blkNum)
+	idByNum, err := b.repo.NewBestChain().GetBlockID(blkNum)
 	if err != nil {
 		return false, err
 	}
-	return ancestorID == blkID, nil
+	return blkID == idByNum, nil
 }
 
 func (b *Blocks) Mount(root *mux.Router, pathPrefix string) {

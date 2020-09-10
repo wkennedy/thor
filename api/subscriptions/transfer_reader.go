@@ -11,16 +11,16 @@ import (
 )
 
 type transferReader struct {
-	chain       *chain.Chain
+	repo        *chain.Repository
 	filter      *TransferFilter
 	blockReader chain.BlockReader
 }
 
-func newTransferReader(chain *chain.Chain, position thor.Bytes32, filter *TransferFilter) *transferReader {
+func newTransferReader(repo *chain.Repository, position thor.Bytes32, filter *TransferFilter) *transferReader {
 	return &transferReader{
-		chain:       chain,
+		repo:        repo,
 		filter:      filter,
-		blockReader: chain.NewBlockReader(position),
+		blockReader: repo.NewBlockReader(position),
 	}
 }
 
@@ -31,20 +31,20 @@ func (tr *transferReader) Read() ([]interface{}, bool, error) {
 	}
 	var msgs []interface{}
 	for _, block := range blocks {
-		receipts, err := tr.chain.GetBlockReceipts(block.Header().ID())
+		receipts, err := tr.repo.GetBlockReceipts(block.Header().ID())
 		if err != nil {
 			return nil, false, err
 		}
 		txs := block.Transactions()
 		for i, receipt := range receipts {
-			for _, output := range receipt.Outputs {
+			for j, output := range receipt.Outputs {
 				for _, transfer := range output.Transfers {
-					origin, err := txs[i].Signer()
+					origin, err := txs[i].Origin()
 					if err != nil {
 						return nil, false, err
 					}
 					if tr.filter.Match(transfer, origin) {
-						msg, err := convertTransfer(block.Header(), txs[i], transfer, block.Obsolete)
+						msg, err := convertTransfer(block.Header(), txs[i], uint32(j), transfer, block.Obsolete)
 						if err != nil {
 							return nil, false, err
 						}

@@ -18,14 +18,16 @@ import (
 	"github.com/ethereum/go-ethereum/event"
 	"github.com/inconshreveable/log15"
 	"github.com/pkg/errors"
+	"github.com/syndtr/goleveldb/leveldb"
+	"github.com/syndtr/goleveldb/leveldb/opt"
 	"github.com/vechain/thor/block"
 	"github.com/vechain/thor/cache"
 	"github.com/vechain/thor/chain"
+	"github.com/vechain/thor/cmd/thor/bandwidth"
 	"github.com/vechain/thor/co"
 	"github.com/vechain/thor/comm"
 	"github.com/vechain/thor/consensus"
 	"github.com/vechain/thor/logdb"
-	"github.com/vechain/thor/lvldb"
 	"github.com/vechain/thor/packer"
 	"github.com/vechain/thor/state"
 	"github.com/vechain/thor/thor"
@@ -36,37 +38,47 @@ import (
 var log = log15.New("pkg", "node")
 
 type Node struct {
-	goes   co.Goes
-	packer *packer.Packer
-	cons   *consensus.Consensus
+	goes     co.Goes
+	packer   *packer.Packer
+	cons     *consensus.Consensus
+	consLock sync.Mutex
 
-	master      *Master
-	chain       *chain.Chain
-	logDB       *logdb.LogDB
-	txPool      *txpool.TxPool
-	txStashPath string
-	comm        *comm.Communicator
-	commitLock  sync.Mutex
+	master         *Master
+	repo           *chain.Repository
+	logDB          *logdb.LogDB
+	txPool         *txpool.TxPool
+	txStashPath    string
+	comm           *comm.Communicator
+	commitLock     sync.Mutex
+	targetGasLimit uint64
+	skipLogs       bool
+	logDBFailed    bool
+	bandwidth      bandwidth.Bandwidth
 }
 
 func New(
 	master *Master,
-	chain *chain.Chain,
-	stateCreator *state.Creator,
+	repo *chain.Repository,
+	stater *state.Stater,
 	logDB *logdb.LogDB,
 	txPool *txpool.TxPool,
 	txStashPath string,
 	comm *comm.Communicator,
+	targetGasLimit uint64,
+	skipLogs bool,
+	forkConfig thor.ForkConfig,
 ) *Node {
 	return &Node{
-		packer:      packer.New(chain, stateCreator, master.Address(), master.Beneficiary),
-		cons:        consensus.New(chain, stateCreator),
-		master:      master,
-		chain:       chain,
-		logDB:       logDB,
-		txPool:      txPool,
-		txStashPath: txStashPath,
-		comm:        comm,
+		packer:         packer.New(repo, stater, master.Address(), master.Beneficiary, forkConfig),
+		cons:           consensus.New(repo, stater, forkConfig),
+		master:         master,
+		repo:           repo,
+		logDB:          logDB,
+		txPool:         txPool,
+		txStashPath:    txStashPath,
+		comm:           comm,
+		targetGasLimit: targetGasLimit,
+		skipLogs:       skipLogs,
 	}
 }
 
@@ -194,7 +206,7 @@ func (n *Node) txStashLoop(ctx context.Context) {
 	log.Debug("enter tx stash loop")
 	defer log.Debug("leave tx stash loop")
 
-	db, err := lvldb.New(n.txStashPath, lvldb.Options{})
+	db, err := leveldb.OpenFile(n.txStashPath, &opt.Options{})
 	if err != nil {
 		log.Error("create tx stash", "err", err)
 		return
@@ -205,7 +217,7 @@ func (n *Node) txStashLoop(ctx context.Context) {
 
 	{
 		txs := stash.LoadAll()
-		n.txPool.Fill(txs)
+		n.txPool.Fill(txs, false)
 		log.Debug("loaded txs from stash", "count", len(txs))
 	}
 
@@ -234,9 +246,14 @@ func (n *Node) txStashLoop(ctx context.Context) {
 }
 
 func (n *Node) processBlock(blk *block.Block, stats *blockStats) (bool, error) {
+
+	// consensus object is not thread-safe
+	n.consLock.Lock()
 	startTime := mclock.Now()
-	now := uint64(time.Now().Unix())
-	stage, receipts, err := n.cons.Process(blk, now)
+	stage, receipts, err := n.cons.Process(blk, uint64(time.Now().Unix()))
+	execElapsed := mclock.Now() - startTime
+	n.consLock.Unlock()
+
 	if err != nil {
 		switch {
 		case consensus.IsKnownBlock(err):
@@ -253,74 +270,120 @@ func (n *Node) processBlock(blk *block.Block, stats *blockStats) (bool, error) {
 		return false, err
 	}
 
-	execElapsed := mclock.Now() - startTime
-
-	if _, err := stage.Commit(); err != nil {
-		log.Error("failed to commit state", "err", err)
-		return false, err
-	}
-
-	fork, err := n.commitBlock(blk, receipts)
+	prevTrunk, curTrunk, err := n.commitBlock(stage, blk, receipts)
 	if err != nil {
-		if !n.chain.IsBlockExist(err) {
-			log.Error("failed to commit block", "err", err)
-		}
+		log.Error("failed to commit block", "err", err)
 		return false, err
 	}
 	commitElapsed := mclock.Now() - startTime - execElapsed
+
+	if v, updated := n.bandwidth.Update(blk.Header(), time.Duration(execElapsed+commitElapsed)); updated {
+		log.Debug("bandwidth updated", "gps", v)
+	}
+
 	stats.UpdateProcessed(1, len(receipts), execElapsed, commitElapsed, blk.Header().GasUsed())
-	n.processFork(fork)
-	return len(fork.Trunk) > 0, nil
+	n.processFork(prevTrunk, curTrunk)
+	return prevTrunk.HeadID() != curTrunk.HeadID(), nil
 }
 
-func (n *Node) commitBlock(newBlock *block.Block, receipts tx.Receipts) (*chain.Fork, error) {
+func (n *Node) commitBlock(stage *state.Stage, newBlock *block.Block, receipts tx.Receipts) (*chain.Chain, *chain.Chain, error) {
 	n.commitLock.Lock()
 	defer n.commitLock.Unlock()
 
-	fork, err := n.chain.AddBlock(newBlock, receipts)
-	if err != nil {
-		return nil, err
+	var (
+		prevBest      = n.repo.BestBlock()
+		becomeNewBest = newBlock.Header().BetterThan(prevBest.Header())
+		awaitLog      = func() {}
+	)
+	defer awaitLog()
+
+	if becomeNewBest && !n.skipLogs && !n.logDBFailed {
+		done := make(chan struct{})
+		awaitLog = func() { <-done }
+
+		go func() {
+			defer close(done)
+
+			diff, err := n.repo.NewChain(newBlock.Header().ParentID()).Exclude(
+				n.repo.NewChain(prevBest.Header().ID()))
+			if err != nil {
+				n.logDBFailed = true
+				log.Warn("failed to write logs", "err", err)
+				return
+			}
+
+			if err := n.writeLogs(diff, newBlock, receipts); err != nil {
+				n.logDBFailed = true
+				log.Warn("failed to write logs", "err", err)
+				return
+			}
+		}()
 	}
 
-	forkIDs := make([]thor.Bytes32, 0, len(fork.Branch))
-	for _, header := range fork.Branch {
-		forkIDs = append(forkIDs, header.ID())
+	if _, err := stage.Commit(); err != nil {
+		return nil, nil, errors.Wrap(err, "commit state")
 	}
 
-	batch := n.logDB.Prepare(newBlock.Header())
-	for i, tx := range newBlock.Transactions() {
-		origin, _ := tx.Signer()
-		txBatch := batch.ForTransaction(tx.ID(), origin)
-		for _, output := range receipts[i].Outputs {
-			txBatch.Insert(output.Events, output.Transfers)
+	if err := n.repo.AddBlock(newBlock, receipts); err != nil {
+		return nil, nil, errors.Wrap(err, "add block")
+	}
+
+	if becomeNewBest {
+		// to wait for log written
+		awaitLog()
+		if err := n.repo.SetBestBlockID(newBlock.Header().ID()); err != nil {
+			return nil, nil, err
 		}
 	}
 
-	if err := batch.Commit(forkIDs...); err != nil {
-		return nil, errors.Wrap(err, "commit logs")
-	}
-	return fork, nil
+	return n.repo.NewChain(prevBest.Header().ID()), n.repo.NewBestChain(), nil
 }
 
-func (n *Node) processFork(fork *chain.Fork) {
-	if len(fork.Branch) >= 2 {
-		trunkLen := len(fork.Trunk)
-		branchLen := len(fork.Branch)
+func (n *Node) writeLogs(diff []thor.Bytes32, newBlock *block.Block, newReceipts tx.Receipts) error {
+	// write full trunk blocks to prevent logs dropped
+	// in rare condition of long fork
+	return n.logDB.Log(func(w *logdb.Writer) error {
+		for _, id := range diff {
+			b, err := n.repo.GetBlock(id)
+			if err != nil {
+				return err
+			}
+			receipts, err := n.repo.GetBlockReceipts(id)
+			if err != nil {
+				return err
+			}
+			if err := w.Write(b, receipts); err != nil {
+				return err
+			}
+		}
+		return w.Write(newBlock, newReceipts)
+	})
+}
+
+func (n *Node) processFork(prevTrunk, curTrunk *chain.Chain) {
+	sideIds, err := prevTrunk.Exclude(curTrunk)
+	if err != nil {
+		log.Warn("failed to process fork", "err", err)
+		return
+	}
+	if len(sideIds) == 0 {
+		return
+	}
+
+	if n := len(sideIds); n >= 2 {
 		log.Warn(fmt.Sprintf(
 			`⑂⑂⑂⑂⑂⑂⑂⑂ FORK HAPPENED ⑂⑂⑂⑂⑂⑂⑂⑂
-ancestor: %v
-trunk:    %v  %v
-branch:   %v  %v`, fork.Ancestor,
-			trunkLen, fork.Trunk[trunkLen-1],
-			branchLen, fork.Branch[branchLen-1]))
+side-chain:   %v  %v`,
+			n, sideIds[n-1]))
 	}
-	for _, header := range fork.Branch {
-		body, err := n.chain.GetBlockBody(header.ID())
+
+	for _, id := range sideIds {
+		b, err := n.repo.GetBlock(id)
 		if err != nil {
-			log.Warn("failed to get block body", "err", err, "blockid", header.ID())
-			continue
+			log.Warn("failed to process fork", "err", err)
+			return
 		}
-		for _, tx := range body.Txs {
+		for _, tx := range b.Transactions() {
 			if err := n.txPool.Add(tx); err != nil {
 				log.Debug("failed to add tx to tx pool", "err", err, "id", tx.ID())
 			}
@@ -329,7 +392,7 @@ branch:   %v  %v`, fork.Ancestor,
 }
 
 func checkClockOffset() {
-	resp, err := ntp.Query("ap.pool.ntp.org")
+	resp, err := ntp.Query("pool.ntp.org")
 	if err != nil {
 		log.Debug("failed to access NTP", "err", err)
 		return

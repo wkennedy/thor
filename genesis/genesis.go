@@ -23,15 +23,15 @@ type Genesis struct {
 }
 
 // Build build the genesis block.
-func (g *Genesis) Build(stateCreator *state.Creator) (blk *block.Block, events tx.Events, err error) {
-	block, events, err := g.builder.Build(stateCreator)
+func (g *Genesis) Build(stater *state.Stater) (blk *block.Block, events tx.Events, transfers tx.Transfers, err error) {
+	block, events, transfers, err := g.builder.Build(stater)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	if block.Header().ID() != g.id {
 		panic("built genesis ID incorrect")
 	}
-	return block, events, nil
+	return block, events, transfers, nil
 }
 
 // ID returns genesis block ID.
@@ -62,22 +62,6 @@ func mustDecodeHex(str string) []byte {
 		panic(err)
 	}
 	return data
-}
-
-func mustParseAddress(str string) thor.Address {
-	addr, err := thor.ParseAddress(str)
-	if err != nil {
-		panic(err)
-	}
-	return addr
-}
-
-func mustParseBytes32(str string) thor.Bytes32 {
-	b32, err := thor.ParseBytes32(str)
-	if err != nil {
-		panic(err)
-	}
-	return b32
 }
 
 var emptyRuntimeBytecode = mustDecodeHex("6060604052600256")

@@ -26,18 +26,21 @@ type Flow struct {
 	gasUsed      uint64
 	txs          tx.Transactions
 	receipts     tx.Receipts
+	features     tx.Features
 }
 
 func newFlow(
 	packer *Packer,
 	parentHeader *block.Header,
 	runtime *runtime.Runtime,
+	features tx.Features,
 ) *Flow {
 	return &Flow{
 		packer:       packer,
 		parentHeader: parentHeader,
 		runtime:      runtime,
 		processedTxs: make(map[thor.Bytes32]bool),
+		features:     features,
 	}
 }
 
@@ -51,13 +54,18 @@ func (f *Flow) When() uint64 {
 	return f.runtime.Context().Time
 }
 
+// TotalScore returns total score of new block.
+func (f *Flow) TotalScore() uint64 {
+	return f.runtime.Context().TotalScore
+}
+
 func (f *Flow) findTx(txID thor.Bytes32) (found bool, reverted bool, err error) {
 	if reverted, ok := f.processedTxs[txID]; ok {
 		return true, reverted, nil
 	}
-	txMeta, err := f.packer.chain.GetTransactionMeta(txID, f.parentHeader.ID())
+	txMeta, err := f.runtime.Chain().GetTransactionMeta(txID)
 	if err != nil {
-		if f.packer.chain.IsNotFound(err) {
+		if f.packer.repo.IsNotFound(err) {
 			return false, false, nil
 		}
 		return false, false, err
@@ -69,18 +77,25 @@ func (f *Flow) findTx(txID thor.Bytes32) (found bool, reverted bool, err error) 
 // If the tx is valid and can be executed on current state (regardless of VM error),
 // it will be adopted by the new block.
 func (f *Flow) Adopt(tx *tx.Transaction) error {
+	origin, _ := tx.Origin()
+	if f.runtime.Context().Number >= f.packer.forkConfig.BLOCKLIST && thor.IsOriginBlocked(origin) {
+		return badTxError{"tx origin blocked"}
+	}
+
+	if err := tx.TestFeatures(f.features); err != nil {
+		return badTxError{err.Error()}
+	}
+
 	switch {
-	case tx.ChainTag() != f.packer.chain.Tag():
+	case tx.ChainTag() != f.packer.repo.ChainTag():
 		return badTxError{"chain tag mismatch"}
-	case tx.HasReservedFields():
-		return badTxError{"reserved fields not empty"}
 	case f.runtime.Context().Number < tx.BlockRef().Number():
 		return errTxNotAdoptableNow
 	case tx.IsExpired(f.runtime.Context().Number):
 		return badTxError{"expired"}
 	case f.gasUsed+tx.Gas() > f.runtime.Context().GasLimit:
-		// gasUsed < 90% gas limit
-		if float64(f.gasUsed)/float64(f.runtime.Context().GasLimit) < 0.9 {
+		// has enough space to adopt minimum tx
+		if f.gasUsed+thor.TxGas+thor.ClauseGas <= f.runtime.Context().GasLimit {
 			// try to find a lower gas tx
 			return errTxNotAdoptableNow
 		}
@@ -128,15 +143,11 @@ func (f *Flow) Pack(privateKey *ecdsa.PrivateKey) (*block.Block, *state.Stage, t
 		return nil, nil, nil, errors.New("private key mismatch")
 	}
 
-	if err := f.runtime.Seeker().Err(); err != nil {
-		return nil, nil, nil, err
-	}
-
-	stage := f.runtime.State().Stage()
-	stateRoot, err := stage.Hash()
+	stage, err := f.runtime.State().Stage()
 	if err != nil {
 		return nil, nil, nil, err
 	}
+	stateRoot := stage.Hash()
 
 	builder := new(block.Builder).
 		Beneficiary(f.runtime.Context().Beneficiary).
@@ -146,7 +157,9 @@ func (f *Flow) Pack(privateKey *ecdsa.PrivateKey) (*block.Block, *state.Stage, t
 		TotalScore(f.runtime.Context().TotalScore).
 		GasUsed(f.gasUsed).
 		ReceiptsRoot(f.receipts.RootHash()).
-		StateRoot(stateRoot)
+		StateRoot(stateRoot).
+		TransactionFeatures(f.features)
+
 	for _, tx := range f.txs {
 		builder.Transaction(tx)
 	}

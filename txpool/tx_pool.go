@@ -6,6 +6,9 @@
 package txpool
 
 import (
+	"context"
+	"math/rand"
+	"os"
 	"sync/atomic"
 	"time"
 
@@ -13,7 +16,6 @@ import (
 	"github.com/ethereum/go-ethereum/common/mclock"
 	"github.com/ethereum/go-ethereum/event"
 	"github.com/inconshreveable/log15"
-	"github.com/pkg/errors"
 	"github.com/vechain/thor/block"
 	"github.com/vechain/thor/builtin"
 	"github.com/vechain/thor/chain"
@@ -34,9 +36,11 @@ var (
 
 // Options options for tx pool.
 type Options struct {
-	Limit           int
-	LimitPerAccount int
-	MaxLifetime     time.Duration
+	Limit                  int
+	LimitPerAccount        int
+	MaxLifetime            time.Duration
+	BlocklistCacheFilePath string
+	BlocklistFetchURL      string
 }
 
 // TxEvent will be posted when tx is added or status changed.
@@ -47,15 +51,17 @@ type TxEvent struct {
 
 // TxPool maintains unprocessed transactions.
 type TxPool struct {
-	options      Options
-	chain        *chain.Chain
-	stateCreator *state.Creator
+	options   Options
+	repo      *chain.Repository
+	stater    *state.Stater
+	blocklist blocklist
 
 	executables    atomic.Value
 	all            *txObjectMap
 	addedAfterWash uint32
 
-	done   chan struct{}
+	ctx    context.Context
+	cancel func()
 	txFeed event.Feed
 	scope  event.SubscriptionScope
 	goes   co.Goes
@@ -63,15 +69,19 @@ type TxPool struct {
 
 // New create a new TxPool instance.
 // Shutdown is required to be called at end.
-func New(chain *chain.Chain, stateCreator *state.Creator, options Options) *TxPool {
+func New(repo *chain.Repository, stater *state.Stater, options Options) *TxPool {
+	ctx, cancel := context.WithCancel(context.Background())
 	pool := &TxPool{
-		options:      options,
-		chain:        chain,
-		stateCreator: stateCreator,
-		all:          newTxObjectMap(),
-		done:         make(chan struct{}),
+		options: options,
+		repo:    repo,
+		stater:  stater,
+		all:     newTxObjectMap(),
+		ctx:     ctx,
+		cancel:  cancel,
 	}
+
 	pool.goes.Go(pool.housekeeping)
+	pool.goes.Go(pool.fetchBlocklistLoop)
 	return pool
 }
 
@@ -79,18 +89,18 @@ func (p *TxPool) housekeeping() {
 	log.Debug("enter housekeeping")
 	defer log.Debug("leave housekeeping")
 
-	ticker := time.NewTicker(time.Second * 2)
+	ticker := time.NewTicker(time.Second * 1)
 	defer ticker.Stop()
 
-	headBlock := p.chain.BestBlock().Header()
+	headBlock := p.repo.BestBlock().Header()
 
 	for {
 		select {
-		case <-p.done:
+		case <-p.ctx.Done():
 			return
 		case <-ticker.C:
 			var headBlockChanged bool
-			if newHeadBlock := p.chain.BestBlock().Header(); newHeadBlock.ID() != headBlock.ID() {
+			if newHeadBlock := p.repo.BestBlock().Header(); newHeadBlock.ID() != headBlock.ID() {
 				headBlock = newHeadBlock
 				headBlockChanged = true
 			}
@@ -130,9 +140,61 @@ func (p *TxPool) housekeeping() {
 	}
 }
 
+func (p *TxPool) fetchBlocklistLoop() {
+	var (
+		path = p.options.BlocklistCacheFilePath
+		url  = p.options.BlocklistFetchURL
+	)
+
+	if path != "" {
+		if err := p.blocklist.Load(path); err != nil {
+			if !os.IsNotExist(err) {
+				log.Warn("blocklist load failed", "error", err, "path", path)
+			}
+		} else {
+			log.Debug("blocklist loaded", "len", p.blocklist.Len())
+		}
+	}
+	if url == "" {
+		return
+	}
+
+	var eTag string
+	fetch := func() {
+		if err := p.blocklist.Fetch(p.ctx, url, &eTag); err != nil {
+			if err == context.Canceled {
+				return
+			}
+			log.Warn("blocklist fetch failed", "error", err, "url", url)
+		} else {
+			log.Debug("blocklist fetched", "len", p.blocklist.Len())
+			if path != "" {
+				if err := p.blocklist.Save(path); err != nil {
+					log.Warn("blocklist save failed", "error", err, "path", path)
+				} else {
+					log.Debug("blocklist saved")
+				}
+			}
+		}
+	}
+
+	fetch()
+
+	for {
+		// delay 1~2 min
+		delay := time.Second * time.Duration(rand.Int()%60+60)
+		select {
+		case <-p.ctx.Done():
+			return
+		case <-time.After(delay):
+			fetch()
+		}
+	}
+}
+
 // Close cleanup inner go routines.
 func (p *TxPool) Close() {
-	close(p.done)
+	p.cancel()
 	p.scope.Close()
 	p.goes.Wait()
 	log.Debug("closed")
@@ -143,35 +205,40 @@ func (p *TxPool) SubscribeTxEvent(ch chan *TxEvent) event.Subscription {
 	return p.scope.Track(p.txFeed.Subscribe(ch))
 }
 
-func (p *TxPool) add(newTx *tx.Transaction, rejectNonexecutable bool) error {
-	if p.all.Contains(newTx.ID()) {
+func (p *TxPool) add(newTx *tx.Transaction, rejectNonexecutable bool, localSubmitted bool) error {
+	if p.all.ContainsHash(newTx.Hash()) {
 		// tx already in the pool
 		return nil
 	}
 
+	origin, _ := newTx.Origin()
+	if thor.IsOriginBlocked(origin) || p.blocklist.Contains(origin) {
+		// tx origin blocked
+		return nil
+	}
+
+	headBlock := p.repo.BestBlock().Header()
+
 	// validation
 	switch {
-	case newTx.ChainTag() != p.chain.Tag():
+	case newTx.ChainTag() != p.repo.ChainTag():
 		return badTxError{"chain tag mismatch"}
-	case newTx.HasReservedFields():
-		return badTxError{"reserved fields not empty"}
 	case newTx.Size() > maxTxSize:
 		return txRejectedError{"size too large"}
 	}
 
-	txObj, err := resolveTx(newTx)
+	if err := newTx.TestFeatures(headBlock.TxsFeatures()); err != nil {
+		return txRejectedError{err.Error()}
+	}
+
+	txObj, err := resolveTx(newTx, localSubmitted)
 	if err != nil {
 		return badTxError{err.Error()}
 	}
 
-	headBlock := p.chain.BestBlock().Header()
 	if isChainSynced(uint64(time.Now().Unix()), headBlock.Timestamp()) {
-		state, err := p.stateCreator.NewState(headBlock.StateRoot())
-		if err != nil {
-			return err
-		}
-
-		executable, err := txObj.Executable(p.chain, state, headBlock)
+		state := p.stater.NewState(headBlock.StateRoot())
+		executable, err := txObj.Executable(p.repo.NewChain(headBlock.ID()), state, headBlock)
 		if err != nil {
 			return txRejectedError{err.Error()}
 		}
@@ -209,17 +276,30 @@ func (p *TxPool) add(newTx *tx.Transaction, rejectNonexecutable bool) error {
 // Add add new tx into pool.
 // It's not assumed as an error if the tx to be added is already in the pool,
 func (p *TxPool) Add(newTx *tx.Transaction) error {
-	return p.add(newTx, false)
+	return p.add(newTx, false, false)
+}
+
+// AddLocal adds new locally submitted tx into pool.
+func (p *TxPool) AddLocal(newTx *tx.Transaction) error {
+	return p.add(newTx, false, true)
+}
+
+// Get get pooled tx by id.
+func (p *TxPool) Get(id thor.Bytes32) *tx.Transaction {
+	if txObj := p.all.GetByID(id); txObj != nil {
+		return txObj.Transaction
+	}
+	return nil
 }
 
 // StrictlyAdd add new tx into pool. A rejection error will be returned, if tx is not executable at this time.
 func (p *TxPool) StrictlyAdd(newTx *tx.Transaction) error {
-	return p.add(newTx, true)
+	return p.add(newTx, true, false)
 }
 
-// Remove removes tx from pool by its ID.
-func (p *TxPool) Remove(txID thor.Bytes32) bool {
-	if p.all.Remove(txID) {
+// Remove removes tx from pool by its Hash.
+func (p *TxPool) Remove(txHash thor.Bytes32, txID thor.Bytes32) bool {
+	if p.all.RemoveByHash(txHash) {
 		log.Debug("tx removed", "id", txID)
 		return true
 	}
@@ -235,11 +315,15 @@ func (p *TxPool) Executables() tx.Transactions {
 }
 
 // Fill fills txs into pool.
-func (p *TxPool) Fill(txs tx.Transactions) {
+func (p *TxPool) Fill(txs tx.Transactions, localSubmitted bool) {
 	txObjs := make([]*txObject, 0, len(txs))
 	for _, tx := range txs {
+		origin, _ := tx.Origin()
+		if thor.IsOriginBlocked(origin) || p.blocklist.Contains(origin) {
+			continue
+		}
 		// here we ignore errors
-		if txObj, err := resolveTx(tx); err == nil {
+		if txObj, err := resolveTx(tx, localSubmitted); err == nil {
 			txObjs = append(txObjs, txObj)
 		}
 	}
@@ -255,7 +339,7 @@ func (p *TxPool) Dump() tx.Transactions {
 // this method should only be called in housekeeping go routine
 func (p *TxPool) wash(headBlock *block.Header) (executables tx.Transactions, removed int, err error) {
 	all := p.all.ToTxObjects()
-	var toRemove []thor.Bytes32
+	var toRemove []*txObject
 	defer func() {
 		if err != nil {
 			// in case of error, simply cut pool size to limit
@@ -264,62 +348,74 @@ func (p *TxPool) wash(headBlock *block.Header) (executables tx.Transactions, rem
 					break
 				}
 				removed++
-				p.all.Remove(txObj.ID())
+				p.all.RemoveByHash(txObj.Hash())
 			}
 		} else {
-			for _, id := range toRemove {
-				p.all.Remove(id)
+			for _, txObj := range toRemove {
+				p.all.RemoveByHash(txObj.Hash())
 			}
 			removed = len(toRemove)
 		}
 	}()
 
-	state, err := p.stateCreator.NewState(headBlock.StateRoot())
+	state := p.stater.NewState(headBlock.StateRoot())
+	baseGasPrice, err := builtin.Params.Native(state).Get(thor.KeyBaseGasPrice)
 	if err != nil {
-		return nil, 0, errors.WithMessage(err, "new state")
+		return nil, 0, err
 	}
+
 	var (
-		seeker            = p.chain.NewSeeker(headBlock.ID())
-		baseGasPrice      = builtin.Params.Native(state).Get(thor.KeyBaseGasPrice)
-		executableObjs    = make([]*txObject, 0, len(all))
-		nonExecutableObjs = make([]*txObject, 0, len(all))
-		now               = time.Now().UnixNano()
+		chain                  = p.repo.NewChain(headBlock.ID())
+		executableObjs         = make([]*txObject, 0, len(all))
+		nonExecutableObjs      = make([]*txObject, 0, len(all))
+		localExecutableObjs    = make([]*txObject, 0, len(all))
+		localNonExecutableObjs = make([]*txObject, 0, len(all))
+		now                    = time.Now().UnixNano()
 	)
 	for _, txObj := range all {
+		if thor.IsOriginBlocked(txObj.Origin()) || p.blocklist.Contains(txObj.Origin()) {
+			toRemove = append(toRemove, txObj)
+			log.Debug("tx washed out", "id", txObj.ID(), "err", "blocked")
+			continue
+		}
+
 		// out of lifetime
-		if now > txObj.timeAdded+int64(p.options.MaxLifetime) {
-			toRemove = append(toRemove, txObj.ID())
+		if !txObj.localSubmitted && now > txObj.timeAdded+int64(p.options.MaxLifetime) {
+			toRemove = append(toRemove, txObj)
 			log.Debug("tx washed out", "id", txObj.ID(), "err", "out of lifetime")
 			continue
 		}
 		// settled, out of energy or dep broken
-		executable, err := txObj.Executable(p.chain, state, headBlock)
+		executable, err := txObj.Executable(chain, state, headBlock)
 		if err != nil {
-			toRemove = append(toRemove, txObj.ID())
+			toRemove = append(toRemove, txObj)
 			log.Debug("tx washed out", "id", txObj.ID(), "err", err)
 			continue
 		}
 
 		if executable {
-			txObj.overallGasPrice = txObj.OverallGasPrice(
-				baseGasPrice,
-				headBlock.Number(),
-				seeker.GetID)
-			executableObjs = append(executableObjs, txObj)
+			provedWork, err := txObj.ProvedWork(headBlock.Number(), chain.GetBlockID)
+			if err != nil {
+				toRemove = append(toRemove, txObj)
+				log.Debug("tx washed out", "id", txObj.ID(), "err", err)
+				continue
+			}
+			txObj.overallGasPrice = txObj.OverallGasPrice(baseGasPrice, provedWork)
+			if txObj.localSubmitted {
+				localExecutableObjs = append(localExecutableObjs, txObj)
+			} else {
+				executableObjs = append(executableObjs, txObj)
+			}
 		} else {
-			nonExecutableObjs = append(nonExecutableObjs, txObj)
+			if txObj.localSubmitted {
+				localNonExecutableObjs = append(localNonExecutableObjs, txObj)
+			} else {
+				nonExecutableObjs = append(nonExecutableObjs, txObj)
+			}
 		}
 	}
 
-	if err := state.Err(); err != nil {
-		return nil, 0, errors.WithMessage(err, "state")
-	}
-
-	if err := seeker.Err(); err != nil {
-		return nil, 0, errors.WithMessage(err, "seeker")
-	}
-
-	// sort objs by price from high to low
+	// sort objs by price from high to low.
 	sortTxObjsByOverallGasPriceDesc(executableObjs)
 
 	limit := p.options.Limit
@@ -327,28 +423,33 @@ func (p *TxPool) wash(headBlock *block.Header) (executables tx.Transactions, rem
 	// remove over limit txs, from non-executables to low priced
 	if len(executableObjs) > limit {
 		for _, txObj := range nonExecutableObjs {
-			toRemove = append(toRemove, txObj.ID())
+			toRemove = append(toRemove, txObj)
 			log.Debug("non-executable tx washed out due to pool limit", "id", txObj.ID())
 		}
 		for _, txObj := range executableObjs[limit:] {
-			toRemove = append(toRemove, txObj.ID())
+			toRemove = append(toRemove, txObj)
 			log.Debug("executable tx washed out due to pool limit", "id", txObj.ID())
 		}
 		executableObjs = executableObjs[:limit]
 	} else if len(executableObjs)+len(nonExecutableObjs) > limit {
 		// executableObjs + nonExecutableObjs over pool limit
 		for _, txObj := range nonExecutableObjs[limit-len(executableObjs):] {
-			toRemove = append(toRemove, txObj.ID())
+			toRemove = append(toRemove, txObj)
 			log.Debug("non-executable tx washed out due to pool limit", "id", txObj.ID())
 		}
 	}
+
+	// Concate executables.
+	executableObjs = append(executableObjs, localExecutableObjs...)
+	// Sort will be faster (part of it already sorted).
+	sortTxObjsByOverallGasPriceDesc(executableObjs)
 
 	executables = make(tx.Transactions, 0, len(executableObjs))
 	var toBroadcast tx.Transactions
 
 	for _, obj := range executableObjs {
 		executables = append(executables, obj.Transaction)
-		if !obj.executable {
+		if !obj.executable || obj.localSubmitted {
 			obj.executable = true
 			toBroadcast = append(toBroadcast, obj.Transaction)
 		}

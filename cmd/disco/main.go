@@ -14,10 +14,10 @@ import (
 
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/log"
-	"github.com/ethereum/go-ethereum/p2p/discv5"
 	"github.com/ethereum/go-ethereum/p2p/nat"
 	"github.com/ethereum/go-ethereum/p2p/netutil"
 	"github.com/pkg/errors"
+	"github.com/vechain/thor/p2psrv/discv5"
 	cli "gopkg.in/urfave/cli.v1"
 )
 
@@ -74,10 +74,10 @@ func run(ctx *cli.Context) error {
 		if key, err = crypto.HexToECDSA(keyHex); err != nil {
 			return errors.Wrap(err, "-keyhex")
 		}
-	}
-
-	if key, err = loadOrGenerateKeyFile(ctx.String("keyfile")); err != nil {
-		return errors.Wrap(err, "-keyfile")
+	} else {
+		if key, err = loadOrGenerateKeyFile(ctx.String("keyfile")); err != nil {
+			return errors.Wrap(err, "-keyfile")
+		}
 	}
 
 	netrestrict := ctx.String("netrestrict")

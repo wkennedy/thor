@@ -8,6 +8,7 @@ package consensus
 import (
 	"crypto/ecdsa"
 	"fmt"
+	"math"
 	"math/big"
 	"reflect"
 	"strings"
@@ -17,9 +18,10 @@ import (
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/stretchr/testify/assert"
 	"github.com/vechain/thor/block"
+	"github.com/vechain/thor/builtin"
 	"github.com/vechain/thor/chain"
 	"github.com/vechain/thor/genesis"
-	"github.com/vechain/thor/lvldb"
+	"github.com/vechain/thor/muxdb"
 	"github.com/vechain/thor/packer"
 	"github.com/vechain/thor/state"
 	"github.com/vechain/thor/thor"
@@ -65,26 +67,37 @@ type testConsensus struct {
 }
 
 func newTestConsensus(t *testing.T) *testConsensus {
-	db, err := lvldb.NewMem()
+	db := muxdb.NewMem()
+
+	launchTime := uint64(1526400000)
+	gen := new(genesis.Builder).
+		GasLimit(thor.InitialGasLimit).
+		Timestamp(launchTime).
+		State(func(state *state.State) error {
+			bal, _ := new(big.Int).SetString("1000000000000000000000000000", 10)
+			state.SetCode(builtin.Authority.Address, builtin.Authority.RuntimeBytecodes())
+			builtin.Params.Native(state).Set(thor.KeyExecutorAddress, new(big.Int).SetBytes(genesis.DevAccounts()[0].Address[:]))
+			for _, acc := range genesis.DevAccounts() {
+				state.SetBalance(acc.Address, bal)
+				state.SetEnergy(acc.Address, bal, launchTime)
+				builtin.Authority.Native(state).Add(acc.Address, acc.Address, thor.Bytes32{})
+			}
+			return nil
+		})
+
+	stater := state.NewStater(db)
+	parent, _, _, err := gen.Build(stater)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	gen := genesis.NewDevnet()
-
-	stateCreator := state.NewCreator(db)
-	parent, _, err := gen.Build(stateCreator)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	c, err := chain.New(db, parent)
+	repo, err := chain.NewRepository(db, parent)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	proposer := genesis.DevAccounts()[0]
-	p := packer.New(c, stateCreator, proposer.Address, &proposer.Address)
+	p := packer.New(repo, stater, proposer.Address, &proposer.Address, thor.NoFork)
 	flow, err := p.Schedule(parent.Header(), uint64(time.Now().Unix()))
 	if err != nil {
 		t.Fatal(err)
@@ -95,7 +108,14 @@ func newTestConsensus(t *testing.T) *testConsensus {
 		t.Fatal(err)
 	}
 
-	con := New(c, stateCreator)
+	forkConfig := thor.ForkConfig{
+		VIP191:    math.MaxUint32,
+		ETH_CONST: math.MaxUint32,
+		BLOCKLIST: 0,
+	}
+
+	con := New(repo, stater, forkConfig)
+
 	if _, _, err := con.Process(original, flow.When()); err != nil {
 		t.Fatal(err)
 	}
@@ -108,7 +128,7 @@ func newTestConsensus(t *testing.T) *testConsensus {
 		pk:       proposer.PrivateKey,
 		parent:   parent,
 		original: original,
-		tag:      c.Tag(),
+		tag:      repo.ChainTag(),
 	}
 }
 
@@ -311,6 +331,21 @@ func (tc *testConsensus) TestValidateBlockBody() {
 			),
 		)
 		expect := consensusError("tx ref future block: ref 100, current 1")
+		tc.assert.Equal(err, expect)
+	}
+	triggers["triggerTxOriginBlocked"] = func() {
+		thor.MockBlocklist([]string{genesis.DevAccounts()[9].Address.String()})
+		t := txBuilder(tc.tag).Build()
+		sig, _ := crypto.Sign(t.SigningHash().Bytes(), genesis.DevAccounts()[9].PrivateKey)
+		t = t.WithSignature(sig)
+
+		blk := tc.sign(
+			tc.originalBuilder().Transaction(t).Build(),
+		)
+		err := tc.consent(blk)
+		expect := consensusError(
+			fmt.Sprintf("tx origin blocked got packed: %v", genesis.DevAccounts()[9].Address),
+		)
 		tc.assert.Equal(err, expect)
 	}
 

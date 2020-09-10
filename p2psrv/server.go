@@ -13,11 +13,11 @@ import (
 	"github.com/ethereum/go-ethereum/common/mclock"
 	"github.com/ethereum/go-ethereum/p2p"
 	"github.com/ethereum/go-ethereum/p2p/discover"
-	"github.com/ethereum/go-ethereum/p2p/discv5"
 	"github.com/ethereum/go-ethereum/p2p/nat"
 	"github.com/inconshreveable/log15"
 	"github.com/vechain/thor/cache"
 	"github.com/vechain/thor/co"
+	"github.com/vechain/thor/p2psrv/discv5"
 )
 
 var log = log15.New("pkg", "p2psrv")
@@ -260,14 +260,21 @@ func (s *Server) dialLoop() {
 	const nonFastDialDur = 2 * time.Second
 	const stableDialDur = 10 * time.Second
 
-	// fast dialing initially
-	ticker := time.NewTicker(fastDialDur)
-	defer ticker.Stop()
-
 	dialCount := 0
 	for {
+		delay := fastDialDur
+		if dialCount == 20 {
+			delay = nonFastDialDur
+		} else if dialCount > 20 {
+			if s.srv.PeerCount() > s.srv.MaxPeers/2 {
+				delay = stableDialDur
+			} else {
+				delay = nonFastDialDur
+			}
+		}
+
 		select {
-		case <-ticker.C:
+		case <-time.After(delay):
 			if s.srv.DialRatio < 1 {
 				continue
 			}
@@ -298,18 +305,6 @@ func (s *Server) dialLoop() {
 			}()
 
 			dialCount++
-			if dialCount == 20 {
-				ticker.Stop()
-				ticker = time.NewTicker(nonFastDialDur)
-			} else if dialCount > 20 {
-				if s.srv.PeerCount() > s.srv.MaxPeers/2 {
-					ticker.Stop()
-					ticker = time.NewTicker(stableDialDur)
-				} else {
-					ticker.Stop()
-					ticker = time.NewTicker(nonFastDialDur)
-				}
-			}
 		case <-s.done:
 			return
 		}

@@ -82,8 +82,12 @@ func (p *Peer) UpdateHead(id thor.Bytes32, totalScore uint64) {
 }
 
 // MarkTransaction marks a transaction to known.
-func (p *Peer) MarkTransaction(id thor.Bytes32) {
-	p.knownTxs.Add(id, struct{}{})
+func (p *Peer) MarkTransaction(hash thor.Bytes32) {
+	// that's 1~5 block intervals
+	expiration := int64(time.Second * time.Duration(thor.BlockInterval*uint64(rand.Intn(5)+1)))
+
+	deadline := time.Now().Unix() + expiration
+	p.knownTxs.Add(hash, deadline)
 }
 
 // MarkBlock marks a block to known.
@@ -92,8 +96,12 @@ func (p *Peer) MarkBlock(id thor.Bytes32) {
 }
 
 // IsTransactionKnown returns if the transaction is known.
-func (p *Peer) IsTransactionKnown(id thor.Bytes32) bool {
-	return p.knownTxs.Contains(id)
+func (p *Peer) IsTransactionKnown(hash thor.Bytes32) bool {
+	deadline, ok := p.knownTxs.Get(hash)
+	if !ok {
+		return false
+	}
+	return deadline.(int64) > time.Now().Unix()
 }
 
 // IsBlockKnown returns if the block is known.

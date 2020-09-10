@@ -15,6 +15,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/vechain/thor/packer"
 	"github.com/vechain/thor/thor"
+	"github.com/vechain/thor/tx"
 )
 
 func (n *Node) packerLoop(ctx context.Context) {
@@ -31,59 +32,69 @@ func (n *Node) packerLoop(ctx context.Context) {
 
 	var (
 		authorized bool
-		flow       *packer.Flow
-		err        error
-		ticker     = time.NewTicker(time.Second)
+		ticker     = n.repo.NewTicker()
 	)
-	defer ticker.Stop()
+
+	n.packer.SetTargetGasLimit(n.targetGasLimit)
 
 	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-		}
-
-		best := n.chain.BestBlock()
 		now := uint64(time.Now().Unix())
 
-		if flow == nil {
-			if flow, err = n.packer.Schedule(best.Header(), now); err != nil {
-				if authorized {
-					authorized = false
-					log.Warn("unable to pack block", "err", err)
-				}
+		if n.targetGasLimit == 0 {
+			// no preset, use suggested
+			suggested := n.bandwidth.SuggestGasLimit()
+			n.packer.SetTargetGasLimit(suggested)
+		}
+
+		flow, err := n.packer.Schedule(n.repo.BestBlock().Header(), now)
+		if err != nil {
+			if authorized {
+				authorized = false
+				log.Warn("unable to pack block", "err", err)
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C():
 				continue
 			}
-			if !authorized {
-				authorized = true
-				log.Info("prepared to pack block")
-			}
-			log.Debug("scheduled to pack block", "after", time.Duration(flow.When()-now)*time.Second)
-			continue
 		}
 
-		if flow.ParentHeader().ID() != best.Header().ID() {
-			flow = nil
-			log.Debug("re-schedule packer due to new best block")
-			continue
+		if !authorized {
+			authorized = true
+			log.Info("prepared to pack block")
 		}
+		log.Debug("scheduled to pack block", "after", time.Duration(flow.When()-now)*time.Second)
 
-		if now+1 >= flow.When() {
-			if err := n.pack(flow); err != nil {
-				log.Error("failed to pack block", "err", err)
+		for {
+			if uint64(time.Now().Unix())+thor.BlockInterval/2 > flow.When() {
+				// time to pack block
+				// blockInterval/2 early to allow more time for processing txs
+				if err := n.pack(flow); err != nil {
+					log.Error("failed to pack block", "err", err)
+				}
+				break
 			}
-			flow = nil
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(time.Second):
+				if n.repo.BestBlock().Header().TotalScore() > flow.TotalScore() {
+					log.Debug("re-schedule packer due to new best block")
+					goto RE_SCHEDULE
+				}
+			}
 		}
+	RE_SCHEDULE:
 	}
 }
 
 func (n *Node) pack(flow *packer.Flow) error {
 	txs := n.txPool.Executables()
-	var txsToRemove []thor.Bytes32
+	var txsToRemove []*tx.Transaction
 	defer func() {
-		for _, id := range txsToRemove {
-			n.txPool.Remove(id)
+		for _, tx := range txsToRemove {
+			n.txPool.Remove(tx.Hash(), tx.ID())
 		}
 	}()
 
@@ -96,7 +107,7 @@ func (n *Node) pack(flow *packer.Flow) error {
 			if packer.IsTxNotAdoptableNow(err) {
 				continue
 			}
-			txsToRemove = append(txsToRemove, tx.ID())
+			txsToRemove = append(txsToRemove, tx)
 		}
 	}
 
@@ -106,19 +117,15 @@ func (n *Node) pack(flow *packer.Flow) error {
 	}
 	execElapsed := mclock.Now() - startTime
 
-	if _, err := stage.Commit(); err != nil {
-		return errors.WithMessage(err, "commit state")
-	}
-
-	fork, err := n.commitBlock(newBlock, receipts)
+	prevTrunk, curTrunk, err := n.commitBlock(stage, newBlock, receipts)
 	if err != nil {
 		return errors.WithMessage(err, "commit block")
 	}
 	commitElapsed := mclock.Now() - startTime - execElapsed
 
-	n.processFork(fork)
+	n.processFork(prevTrunk, curTrunk)
 
-	if len(fork.Trunk) > 0 {
+	if prevTrunk.HeadID() != curTrunk.HeadID() {
 		n.comm.BroadcastBlock(newBlock)
 		log.Info("📦 new block packed",
 			"txs", len(receipts),
@@ -128,15 +135,8 @@ func (n *Node) pack(flow *packer.Flow) error {
 		)
 	}
 
-	n.packer.SetTargetGasLimit(0)
-	if execElapsed > 0 {
-		gasUsed := newBlock.Header().GasUsed()
-		// calc target gas limit only if gas used above third of gas limit
-		if gasUsed > newBlock.Header().GasLimit()/3 {
-			targetGasLimit := uint64(thor.TolerableBlockPackingTime) * gasUsed / uint64(execElapsed)
-			n.packer.SetTargetGasLimit(targetGasLimit)
-			log.Debug("reset target gas limit", "value", targetGasLimit)
-		}
+	if v, updated := n.bandwidth.Update(newBlock.Header(), time.Duration(execElapsed+commitElapsed)); updated {
+		log.Debug("bandwidth updated", "gps", v)
 	}
 	return nil
 }
